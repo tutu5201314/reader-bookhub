@@ -77,10 +77,14 @@ function setHint() {
 }
 
 let searchES = null;   // 当前搜索流；重复搜索时先关掉上一条
+let CAP = 60;          // 服务端默认结果上限（/api/config 里读）
+let curLimit = 0;      // 本次搜索用的 limit；0 = 用服务端默认
 
-async function doSearch() {
+async function doSearch(more) {
   const q = $('q').value.trim();
   if (!q) return;
+  if (!more) curLimit = 0;
+  else curLimit = Math.min(300, (curLimit || CAP) + CAP);
   // 粘贴了网址：直接解析这本书，不走聚合搜索
   if (/^https?:\/\/\S+$/i.test(q) || /^[a-z0-9-]+(\.[a-z0-9-]+)+(\/\S*)?$/i.test(q)) {
     const url = /^https?:/i.test(q) ? q : 'http://' + q;
@@ -108,7 +112,8 @@ async function doSearch() {
   };
   updateWebLine();
 
-  const es = new EventSource('/api/search/stream?q=' + encodeURIComponent(q));
+  const es = new EventSource('/api/search/stream?q=' + encodeURIComponent(q) +
+                             (curLimit ? '&limit=' + curLimit : ''));
   searchES = es;
 
   es.onmessage = ev => {
@@ -138,6 +143,13 @@ async function doSearch() {
       if (spin.parentNode) spin.remove();
       if (!cards.children.length) {
         box.innerHTML = '<div class="empty">没有找到。试试：<br>1) 换关键词（去掉序号/符号）<br>2) 直接粘贴书籍目录页网址到搜索框</div>';
+      } else if (cards.children.length >= (curLimit || CAP) && (curLimit || CAP) < 300) {
+        // 打到上限了才给「显示更多」——没打满说明真没了，不画多余的按钮
+        const more = document.createElement('div');
+        more.className = 'empty';
+        more.innerHTML = `已显示 ${cards.children.length} 条，可能还有更多：` +
+          `<button class="btn" onclick="doSearch(true)">显示更多</button>`;
+        box.appendChild(more);
       }
     }
   };
@@ -311,6 +323,7 @@ async function simpleJob(path, name) {
 
 (async function init() {
   const cfg = await api('/api/config');
+  if (cfg.max_results) CAP = cfg.max_results;
   HINT = `.reader 目录：<b>${esc(cfg.reader_dir)}</b><br>Reader 端使用：导入一次 <b>bs_gateway.json</b> 书源后，在 Reader 搜索框直接搜书名，所有书（含被防护站点）均可在线阅读。`;
   setHint();
   loadShelf();

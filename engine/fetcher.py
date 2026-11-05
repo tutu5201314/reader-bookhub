@@ -7,6 +7,7 @@
 import re
 import threading
 import time
+import queue
 
 import os
 import requests
@@ -36,12 +37,23 @@ class BrowserResponse:
 
 
 class BrowserLayer:
-    """L3：真浏览器（Chrome 优先，Edge 兜底），懒启动、进程内单例。"""
+    """L3：真浏览器（Chrome 优先，Edge 兜底），懒启动、进程内单例。
 
-    def __init__(self, headless=True):
+    单个 ChromiumPage 配一把全局锁时，并发 L3 请求严格排队（page.get 25s +
+    等 JS 挑战 10s），8 个候选最坏 8×35s，直接被外层预算切掉。这里改成
+    标签页池：最多 POOL_SIZE 个 tab，每个 tab 一把锁，并发上限从 1 提到 2，
+    且单次等挑战有硬上限（wait），超时立即返回，不再死等 10s。
+    """
+
+    POOL_SIZE = 2
+
+    def __init__(self, headless=True, pool_size=None):
         self.headless = headless
+        self._pool_size = max(1, int(pool_size or self.POOL_SIZE))
         self._page = None
-        self._lock = threading.Lock()
+        self._lock = threading.Lock()      # 只管「启动浏览器 / 建 tab」
+        self._tabs = []                    # [(tab, lock), ...]
+        self._free = queue.Queue()
 
     def _ensure(self):
         if self._page is not None:
@@ -69,21 +81,58 @@ class BrowserLayer:
         self._page = ChromiumPage(opts)
         return self._page
 
-    def get(self, url, timeout=25):
+    def _acquire(self, timeout=30):
+        """取一个空闲标签页 (tab, lock)；池子满了就排队等，等不到返回 None。"""
+        try:
+            return self._free.get_nowait()
+        except queue.Empty:
+            pass
         with self._lock:
             page = self._ensure()
-            page.get(url, timeout=timeout)
-            # 等 JS 挑战跳转完成（CF 会有 5 秒等待页）
-            deadline = time.time() + 10
-            while time.time() < deadline:
-                html = page.html or ""
-                if html and not is_waf_page(html.encode("utf-8", errors="ignore")):
-                    break
-                time.sleep(1)
-            return BrowserResponse(page.url or url, page.html or "")
+            if len(self._tabs) < self._pool_size:
+                tab = page if not self._tabs else page.new_tab()
+                item = (tab, threading.Lock())
+                self._tabs.append(item)
+                return item
+        try:
+            return self._free.get(timeout=timeout)
+        except queue.Empty:
+            return None
+
+    def get(self, url, timeout=25, wait=6):
+        item = self._acquire(timeout=wait + timeout)
+        if item is None:            # 池子被占满且等超时：快速失败，别拖住调用方
+            return None
+        tab, lk = item
+        try:
+            with lk:
+                tab.get(url, timeout=timeout)
+                # 等 JS 挑战跳转完成（CF 会有 5 秒等待页）。轮询间隔 0.4s，
+                # 上限 wait 秒 —— 原来固定 10s 硬等，慢站会把并发全拖死。
+                html = tab.html or ""
+                deadline = time.time() + wait
+                while time.time() < deadline:
+                    if html and not is_waf_page(html.encode("utf-8", errors="ignore")):
+                        break
+                    time.sleep(0.4)
+                    html = tab.html or ""
+                return BrowserResponse(tab.url or url, tab.html or html)
+        finally:
+            self._free.put(item)
 
     def close(self):
         with self._lock:
+            for tab, _lk in self._tabs:
+                try:
+                    tab.close() if tab is not self._page else tab.quit()
+                except Exception:
+                    pass
+            self._tabs = []
+            while not self._free.empty():
+                try:
+                    self._free.get_nowait()
+                except queue.Empty:
+                    break
             if self._page is not None:
                 try:
                     self._page.quit()
@@ -104,6 +153,11 @@ class LayeredFetcher:
         self._headless = headless
         self.debug = debug
         self.last = 0.0
+        # 每站节流：{host: 上次请求时间戳}。原来是一个全局 self.last，10 个种子站
+        # 并发搜索时全排同一个 0.6s 闸门（实测「遮天」正好 6.0s = 10 × 0.6s），
+        # 站点响应时间被节流完全掩盖。改成按 host 后，对单站仍礼貌，跨站互不拖累。
+        self._last_by_host = {}
+        self._throttle_lock = threading.Lock()
         self.layer_stats = {"L1": 0, "L2": 0, "L3": 0}
         # 每站熔断：{host: [连续失败数, 冷却截止时间戳]}
         # 连续 3 次全层失败 → 冷却 90 秒（期间直接快速失败，不重试），
@@ -148,11 +202,19 @@ class LayeredFetcher:
     def post(self, url, data=None, **kw):
         return self._req("POST", url, data=data, **kw)
 
-    def _throttle(self):
-        dt = time.time() - self.last
-        if dt < 0.6:
-            time.sleep(0.6 - dt)
-        self.last = time.time()
+    def _throttle(self, url=""):
+        """同一站点两次请求间隔 ≥0.6s；不同站点各自计时，互不排队。"""
+        host = self._host_of(url) if url else ""
+        now = time.time()
+        with self._throttle_lock:
+            last = self._last_by_host.get(host, 0.0)
+            wait = 0.6 - (now - last)
+            # 先占位再睡：把本线程的「发车时刻」写回去，后面的线程据此顺延，
+            # 避免多个线程同时算出 wait=0 一起冲同一站点。
+            self._last_by_host[host] = max(now, last + 0.6)
+            self.last = now
+        if wait > 0:
+            time.sleep(wait)
 
     def _ok(self, r):
         return r is not None and r.status_code == 200 and not is_waf_page(r.content)
@@ -195,7 +257,7 @@ class LayeredFetcher:
         if quick:
             return self._req_quick(method, url, data, referer,
                                    allow_l2=allow_l2, timeout=timeout)
-        self._throttle()
+        self._throttle(url)
         headers = {}
         if referer:
             headers["Referer"] = referer

@@ -3,5 +3,7 @@
   "port": 8787,
   "gateway_port": 80,
   "reader_dir": "D:\\bookhub-books",
-  "headless": true
+  "headless": true,
+  "max_results": 60,
+  "cache_max_mb": 500
 }

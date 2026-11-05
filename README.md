@@ -82,6 +82,8 @@ pip install -r requirements.txt
 | `reader_dir` | ./books | txt 导出目录，改成你的 Reader 书目录 |
 | `host` | 127.0.0.1 | 只监听本机，外部无法访问 |
 | `headless` | true | L3 兜底浏览器是否无头 |
+| `max_results` | 60 | 搜索聚合结果上限；网页台可用 `?limit=` 临时覆盖（≤300），打满时底部给「显示更多」 |
+| `cache_max_mb` | 500 | 章节缓存总配额（MB）；超了启动时按最久未读整本清（书架与进度不动） |
 
 模板见 `config.example.json`。
 

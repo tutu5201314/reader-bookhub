@@ -21,6 +21,10 @@ except ImportError:
 
 SEEDS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "seeds.json")
 
+# 结果条数上限：10 个站已经能把常见书名打满，再往上加只会让来源更分散。
+# 需要更多时由 server 的 limit 参数 / config.json 的 max_results 覆盖。
+MAX_RESULTS = 60
+
 _FOLD_CACHE = {}
 
 
@@ -144,13 +148,14 @@ def _web_discover_safe(fetcher, keyword, author, stats):
 
 
 def aggregate_search(fetcher, keyword, seeds=None, timeout_per_site=40, web=True,
-                     stats=None):
+                     stats=None, max_results=None):
     """三层搜索：种子站直搜（并发）+ 搜索引擎发现层（Bing / 百度兜底）。
     输入支持『书名 作者』联合查询：作者用于结果过滤排序，搜索用书名。
     返回扁平列表：作者匹配的最前，其余按相关度。
 
     stats：可选 dict，回填各阶段耗时（秒）——seed / sites / bing / baidu /
-    verify / total，由调用方决定是否落日志（不传则零开销）。"""
+    verify / total，由调用方决定是否落日志（不传则零开销）。
+    max_results：结果条数上限，默认 MAX_RESULTS（配置项可覆盖）。"""
     t_start = time.time()
     keyword, want_author = split_query(keyword)
     seeds = seeds or load_seeds()
@@ -260,7 +265,8 @@ def aggregate_search(fetcher, keyword, seeds=None, timeout_per_site=40, web=True
         uniq.append(r_)
     if stats is not None:
         stats["total"] = time.time() - t_start
-    return uniq[:60], errors
+    limit = MAX_RESULTS if not max_results else int(max_results)
+    return uniq[:limit], errors
 
 
 def maybe_add_seed(src, fetcher):

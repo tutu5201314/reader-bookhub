@@ -12,11 +12,10 @@ import threading
 import time
 import uuid
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "autobs"))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from concurrent.futures import ThreadPoolExecutor, as_completed
-
+from concurrent.futures import (ThreadPoolExecutor, as_completed,
+                                wait, FIRST_COMPLETED)
 from fastapi import FastAPI, Request, Query
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, StreamingResponse
 
@@ -38,6 +37,12 @@ DEF_CONFIG = {
     "gateway_port": 80,
     "reader_dir": os.path.join(BASE_DIR, "books"),  # txt 导出目录，可在 config.json 改
     "headless": True,
+    # 搜索结果条数上限。10 个种子站已能把常见书名打满 60 条，需要更全时调高
+    # （网页台还可以用 ?limit= 临时覆盖，Reader 网关那条路仍按 60 渲染）。
+    "max_results": 60,
+    # 章节缓存总配额（MB）。实测约 8.5KB/章，1859 章的书全缓存 ≈ 16MB。
+    # 超了就在启动时按「最久没读过」整本清掉（书架和阅读进度不动）。
+    "cache_max_mb": 500,
 }
 config = dict(DEF_CONFIG)
 if os.path.exists(CONFIG_PATH):
@@ -49,6 +54,10 @@ else:
     # 首次运行生成配置（已存在则不覆盖用户配置）
     with open(CONFIG_PATH, "w", encoding="utf-8") as fp:
         json.dump(config, fp, ensure_ascii=False, indent=2)
+
+# SSE 流式搜索的总时长预算（秒）。首批结果靠「谁先回谁先推」保证（通常 1~3s），
+# 这个预算只管收尾：慢站（历史最慢 45s）不再一刀切掉已经算完的结果。
+SSE_TOTAL_BUDGET = 60
 
 # 运行日志轮转：超 1MB 截断，防止无限增长
 LOG_PATH = os.path.join(BASE_DIR, "server.log")
@@ -217,14 +226,43 @@ store = gw.BookStore()
 # ---------------- 后台任务 ----------------
 JOBS = {}
 JOBS_LOCK = threading.Lock()
+JOBS_TTL = 1800      # 已完成的任务保留 30 分钟
+JOBS_MAX = 20        # 最多同时留 20 条记录（挂一整天也不会涨）
+
+
+def _prune_jobs(now=None, reserve=0):
+    """回收已结束的任务记录：先按时间过期，再按条数裁到 JOBS_MAX。
+
+    reserve：调用方马上要新增几条，先给它留出位置（否则插完会多出 reserve 条）。
+    跑着的任务（status == "running"）一律不动——那是正在进行的工作。
+    """
+    now = now or time.time()
+    cap = max(1, JOBS_MAX - int(reserve))
+    with JOBS_LOCK:
+        for jid in [j for j, v in JOBS.items()
+                    if v.get("status") != "running"
+                    and now - v.get("finished_at", v.get("created", now)) > JOBS_TTL]:
+            JOBS.pop(jid, None)
+        if len(JOBS) > cap:
+            old = sorted((v.get("finished_at", v.get("created", 0)), j)
+                         for j, v in JOBS.items() if v.get("status") != "running")
+            for _, jid in old[:len(JOBS) - cap]:
+                JOBS.pop(jid, None)
 
 
 def _new_job(kind):
+    _prune_jobs(reserve=1)
     jid = uuid.uuid4().hex[:12]
     with JOBS_LOCK:
         JOBS[jid] = {"id": jid, "kind": kind, "status": "running",
                      "progress": 0, "log": [], "result": None, "created": time.time()}
     return JOBS[jid]
+
+
+def _finish(job, status):
+    """标记任务结束（顺带记完成时间，供 _prune_jobs 回收）。"""
+    job["status"] = status
+    job["finished_at"] = time.time()
 
 
 def _job_log(job, msg):
@@ -237,7 +275,7 @@ def _run_resolve_job(job, bid, url, want_txt):
     try:
         b, err = store.ensure_resolved(bid, fetcher, force=True)
         if err:
-            job["status"] = "failed"
+            _finish(job, "failed")
             job["result"] = {"error": err}
             return
         job["progress"] = 60
@@ -264,10 +302,10 @@ def _run_resolve_job(job, bid, url, want_txt):
         if want_txt:
             txt_path = _export_txt(b, job)
             out["txt_file"] = txt_path
-        job["status"] = "done"
+        _finish(job, "done")
         job["progress"] = 100
     except Exception as e:
-        job["status"] = "failed"
+        _finish(job, "failed")
         job["result"] = {"error": "%s: %s" % (type(e).__name__, e)}
 
 
@@ -307,14 +345,18 @@ def _book_info(b):
 @app.get("/api/config")
 def api_config():
     return {"base": gw_base(), "reader_dir": config["reader_dir"],
-            "xpaths": gw.GW_XPATHS, "layer_stats": fetcher.layer_stats}
+            "xpaths": gw.GW_XPATHS, "layer_stats": fetcher.layer_stats,
+            "max_results": int(config.get("max_results") or 60),
+            "cache_max_mb": int(config.get("cache_max_mb") or 500)}
 
 
 @app.get("/api/search")
-def api_search(q: str = Query(..., min_length=1)):
+def api_search(q: str = Query(..., min_length=1),
+               limit: int = Query(0, ge=0, le=300)):
     t0 = time.time()
     stats = {}
-    results, errors = aggregate_search(fetcher, q, stats=stats)
+    results, errors = aggregate_search(fetcher, q, stats=stats,
+                                       max_results=limit or config.get("max_results"))
     results = _merge_shelf(q, results)
     out = []
     for r in results:
@@ -327,13 +369,15 @@ def api_search(q: str = Query(..., min_length=1)):
 
 
 @app.get("/api/search/stream")
-def api_search_stream(q: str = Query(..., min_length=1)):
+def api_search_stream(q: str = Query(..., min_length=1),
+                      limit: int = Query(0, ge=0, le=300)):
     """流式搜索（SSE）：种子站与发现层并发，谁先出结果就先推给前端。
 
     前端用 EventSource 接收，逐批 append，不必等最慢的那个源。
     事件：{"type":"batch","site":..,"src":..,"items":[..],"elapsed":..}
           {"type":"status","msg":..}
           {"type":"done","total":..,"elapsed":..}"""
+    cap = limit or config.get("max_results") or 0
     def _sse(obj):
         return "data: %s\n\n" % json.dumps(obj, ensure_ascii=False)
 
@@ -374,25 +418,42 @@ def api_search_stream(q: str = Query(..., min_length=1)):
             seed_futs = {ex.submit(_search_site, fetcher, s, q, site_ms): s
                          for s in seeds}
             web_fut = ex.submit(web_discover, fetcher, q, stats=stats)
-            for fut in as_completed(list(seed_futs) + [web_fut], timeout=45):
-                if fut is web_fut:
-                    label, src = "全网发现", "web"
-                else:
-                    label, src = seed_futs[fut]["name"], "seed"
-                try:
-                    raw = fut.result()
-                except Exception as e:
-                    yield _sse({"type": "status",
-                                "msg": "%s 失败：%s" % (label, str(e)[:40])})
-                    continue
-                items = _pack(raw, src)
-                if items:
-                    total += len(items)
-                    yield _sse({"type": "batch", "site": label, "src": src,
-                                "items": items,
-                                "elapsed": round(time.time() - t0, 1)})
-        except TimeoutError:
-            yield _sse({"type": "status", "msg": "部分来源超时，已返回现有结果"})
+            pending = set(seed_futs) | {web_fut}
+            # 两段式预算：流式本身保证首批结果几秒内就推出去（谁先回谁先推），
+            # 这里管的是总时长 —— 原来 as_completed(timeout=45) 一刀切，45s 时
+            # 已算完但还没轮到的 future 会连同结果一起被丢掉；改成手动轮询后
+            # 只要总预算没到，拿到一个推一个。
+            deadline = t0 + SSE_TOTAL_BUDGET
+            while pending:
+                left = deadline - time.time()
+                if left <= 0:
+                    yield _sse({"type": "status", "msg": "部分来源超时，已返回现有结果"})
+                    break
+                done, pending = wait(pending, timeout=min(left, 5),
+                                     return_when=FIRST_COMPLETED)
+                if not done:
+                    continue        # 只是这一轮没等到，继续等剩下的
+                for fut in done:
+                    if fut is web_fut:
+                        label, src = "全网发现", "web"
+                    else:
+                        label, src = seed_futs[fut]["name"], "seed"
+                    try:
+                        raw = fut.result()
+                    except Exception as e:
+                        yield _sse({"type": "status",
+                                    "msg": "%s 失败：%s" % (label, str(e)[:40])})
+                        continue
+                    if cap and total >= cap:
+                        continue    # 已经够数，剩下的只 drain 不推
+                    items = _pack(raw, src)
+                    if cap:
+                        items = items[:max(0, cap - total)]
+                    if items:
+                        total += len(items)
+                        yield _sse({"type": "batch", "site": label, "src": src,
+                                    "items": items,
+                                    "elapsed": round(time.time() - t0, 1)})
         finally:
             ex.shutdown(wait=False)   # 不等卡死的源，避免拖住本次请求
 
@@ -452,6 +513,17 @@ def api_clear_cache(bid: str):
     return {"ok": True}
 
 
+@app.get("/api/cache/stats")
+def api_cache_stats():
+    """章节缓存总览：总大小 / 配额 / 每本占用与最后访问时间（最旧在前）。"""
+    st = gw.cache_stats()
+    limit = int(config.get("cache_max_mb") or 500) * 1024 * 1024
+    titles = {b["id"]: (b.get("title") or "")[:30] for b in store.all(shelf_only=False)}
+    for b in st["books"]:
+        b["title"] = titles.get(b["id"], "")
+    return {"total": st["total"], "limit": limit, "books": st["books"]}
+
+
 @app.post("/api/txt/{bid}")
 def api_txt(bid: str):
     b = store.get(bid)
@@ -463,12 +535,12 @@ def api_txt(bid: str):
         try:
             b2, err = store.ensure_resolved(bid, fetcher)
             if err:
-                job["status"] = "failed"; job["result"] = {"error": err}; return
+                _finish(job, "failed"); job["result"] = {"error": err}; return
             path = _export_txt(b2, job)
             job["result"] = {"txt_file": path}
-            job["status"] = "done"; job["progress"] = 100
+            _finish(job, "done"); job["progress"] = 100
         except Exception as e:
-            job["status"] = "failed"; job["result"] = {"error": str(e)}
+            _finish(job, "failed"); job["result"] = {"error": str(e)}
 
     threading.Thread(target=_run, daemon=True).start()
     return {"job_id": job["id"]}
@@ -484,9 +556,9 @@ def api_refresh(bid: str):
     def _run():
         b2, err = store.ensure_resolved(bid, fetcher, force=True)
         if err:
-            job["status"] = "failed"; job["result"] = {"error": err}; return
+            _finish(job, "failed"); job["result"] = {"error": err}; return
         job["result"] = _book_info(b2)
-        job["status"] = "done"; job["progress"] = 100
+        _finish(job, "done"); job["progress"] = 100
 
     threading.Thread(target=_run, daemon=True).start()
     return {"job_id": job["id"]}
@@ -516,10 +588,11 @@ def api_healthcheck():
     def _run():
         import sys as _sys
         _sys.path.insert(0, BASE_DIR)
+        from concurrent.futures import ThreadPoolExecutor, as_completed
         from tests.quality import check_chapter_text
-        books = store.all(shelf_only=True)
-        report = []
-        for i, b in enumerate(books):
+
+        def _check_one(b):
+            """单本体检：1 次探活 + 首/中/末章各一次快抓（有缓存则读缓存）。"""
             entry = {"id": b["id"], "title": (b.get("title") or "")[:30],
                      "site": b.get("site") or "", "alive": False,
                      "catalog": 0, "chapters": [], "ok": False}
@@ -531,14 +604,13 @@ def api_healthcheck():
             entry["catalog"] = len(b2.get("chapters") or []) if b2 else 0
             # 抽查：首章 quick 抓取断言；中/末章只读已有缓存
             if b2 and entry["catalog"]:
-                import hashlib as _h, os as _os
                 n = entry["catalog"]
-                cache_dir = _os.path.join(BASE_DIR, "data", "cache", b["id"])
                 for idx in sorted({0, n // 2, n - 1}):
                     ch = b2["chapters"][idx]
                     text = None
-                    cpath = _os.path.join(cache_dir, _h.md5(ch["url"].encode()).hexdigest()[:16] + ".txt")
-                    if _os.path.exists(cpath):
+                    # 缓存键算法统一走网关，别在这儿重算 md5
+                    cpath = gw.cache_path(b["id"], ch["url"])
+                    if os.path.exists(cpath):
                         try:
                             text = open(cpath, encoding="utf-8").read()
                         except Exception:
@@ -564,10 +636,27 @@ def api_healthcheck():
             # 已缓存章节仍可读）
             entry["ok"] = bool(entry["catalog"]) and all(
                 not c["problems"] for c in entry["chapters"])
-            report.append(entry)
-            job["progress"] = int(100 * (i + 1) / max(1, len(books)))
-            _job_log(job, "体检 %d/%d：%s %s" % (i + 1, len(books), entry["title"],
-                                                 "✓" if entry["ok"] else "发现问题"))
+            return entry
+
+        books = store.all(shelf_only=True)
+        # 逐本串行时 5 本书最坏 5 × (8s + 3×8s) = 160s，网页台看着像卡死。
+        # quick=True 不走节流，4 并发对目标站仍是可接受的压力。
+        by_id = {}
+        with ThreadPoolExecutor(max_workers=4) as ex:
+            futs = [ex.submit(_check_one, b) for b in books]
+            for fut in as_completed(futs):
+                try:
+                    entry = fut.result()
+                except Exception as e:      # 单本异常不能拖垮整轮体检
+                    _job_log(job, "体检跳过一本：%r" % (e,))
+                    continue
+                by_id[entry["id"]] = entry
+                job["progress"] = int(100 * len(by_id) / max(1, len(books)))
+                _job_log(job, "体检 %d/%d：%s %s" % (
+                    len(by_id), len(books), entry["title"],
+                    "✓" if entry["ok"] else "发现问题"))
+        # 按书架顺序输出，结果稳定可比对
+        report = [by_id[b["id"]] for b in books if b["id"] in by_id]
         # 落盘 + 完成报告
         try:
             import json as _json
@@ -579,7 +668,7 @@ def api_healthcheck():
         job["result"] = {"books": report,
                          "n_ok": sum(1 for e in report if e["ok"]),
                          "n_total": len(report)}
-        job["status"] = "done"; job["progress"] = 100
+        _finish(job, "done"); job["progress"] = 100
 
     threading.Thread(target=_run, daemon=True).start()
     return {"job_id": job["id"]}
@@ -701,6 +790,17 @@ if __name__ == "__main__":
         print("Reader 网关:   %s  (%s，网关已并入主端口；"
               "此前导入过书源的需在 Reader 里重新导入一次)" % (GW_PRIMARY, reason))
     print("网关书源文件: %s （导入 Reader 一次，之后 Reader 搜索框直搜所有站）" % bs_path)
+
+    # ④ 章节缓存配额：超了就按最久未读整本清掉，避免无限长胖
+    try:
+        _limit = int(config.get("cache_max_mb") or 500) * 1024 * 1024
+        _r = gw.prune_cache(_limit)
+        if _r["removed"]:
+            print("[bookhub] 章节缓存 %.1fMB 超配额 %.0fMB，已清理 %d 本（释放 %.1fMB）"
+                  % (_r["before"] / 1048576.0, _limit / 1048576.0,
+                     len(_r["removed"]), _r["freed"] / 1048576.0))
+    except Exception as e:
+        print("[bookhub] 缓存配额检查跳过：%s" % e)
 
     # ④ 起监听：网关在子线程（失败不影响网页台），主端口在主线程
     def _serve_gateway(port):

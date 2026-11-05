@@ -232,6 +232,14 @@ def parse_doc(resp):
             head = " ".join(doc.xpath("//title/text()"))[:300]
         except Exception:
             head = ""
+        if not _looks_mojibake(head):
+            # 有的页面没有 <title>，或 title 是纯 ASCII 而正文是中文 —— 只探 title 会漏，
+            # 正文按 Latin-1 误解后「下一页」之类的锚点文案也会跟着错，续页永远找不到。
+            try:
+                head = head + " " + " ".join(
+                    doc.xpath("//body//text()[position() <= 5]"))[:300]
+            except Exception:
+                pass
         if _looks_mojibake(head):
             try:
                 alt = lxml.html.fromstring(resp.text, base_url=resp.url)
@@ -1343,9 +1351,16 @@ def extract_content_text(container):
     text = text.replace("\xa0", "")  # 站点用不间断空格做缩进，去掉（段落换行已保留）
     lines = [ln.strip() for ln in text.split("\n")]
     lines = [_cut_nav_prefix(ln) for ln in lines]
-    lines = [ln for ln in lines
-             if ln and not is_watermark_line(ln) and not _is_js_text(ln)]
-    return "\n".join(lines)
+    total = len(lines)
+    kept = []
+    for i, ln in enumerate(lines):
+        if not ln or _is_js_text(ln):
+            continue
+        # 传位置：裸数字行只在首尾 3 行内才当水印，正文中间的小节号要留
+        if is_watermark_line(ln, i, total):
+            continue
+        kept.append(ln)
+    return "\n".join(kept)
 
 
 _NAV_WORDS = re.compile(r"(上一章|下一章|章节目录|保存书签|返回目录|加入书签|上一页|下一页)")
@@ -1371,7 +1386,6 @@ WATERMARK_LINE = [
     re.compile(r"请退出.{0,4}阅读模式"),
     re.compile(r"退出.{0,2}阅.{0,2}读.{0,2}模.{0,2}式"),
     re.compile(r"^[^。！？]{0,30}本书作者.{0,10}提醒您"),  # ❚本书作者xx提醒您《..
-    re.compile(r"#.*#.*#"),                   # 「如章节缺失请退#出#阅#读#模#式」式分行水印
     re.compile(r"^温馨提示[:：]"),            # 按键提示等
     re.compile(r"本章未完|点击下一页|下一页继续阅读"),      # 站方正文分页提示
     re.compile(r"^[没有了目录设置书签分享打赏]{1,12}$"),   # 章尾散碎导航词行
@@ -1381,17 +1395,36 @@ WATERMARK_LINE = [
     re.compile(r".{0,20}最快更新.{0,50}$"),      # 以沫系：站名+最快更新首行水印
     re.compile(r"扫描二维码|手机浏览器"),              # yqyp 系：手机扫码提示头
     re.compile(r"记住.{0,10}域名|朋友.{0,6}书荒|看最新章节.{0,3}完整章节"),  # wanwx 系：防盗截断尾水印
-    re.compile(r"^\d{1,4}$"),              # 章首裸编号行（001/002 式页面装饰）
     re.compile(r"剧情升级|故事走向更值得期待"),   # boshishuwu 系：全站固定 AI 导读语
     re.compile(r"请收藏本站|手机版[:：]?[a-z0-9.]{4,}$"),  # nana00 系：章尾收藏提示
 ]
 
+# 裸数字行（001/002 式页面装饰）：只有出现在章首/章尾 3 行内才算水印。
+# 原来是无条件整行删，正文里独立成行的小节号、诗行数字、分隔序号被一起吃掉。
+_BARE_NUM = re.compile(r"^\d{1,4}$")
+# 纯装饰分隔线（无中文）：##===##== 这类整行删掉不影响内容
+_HASH_SEP = re.compile(r"^[#\s\-=_*~·—]{3,}$")
+# 插字符水印的语义特征：「请退#出#阅#读#模#式」。带 # 的行必须同时命中这些词
+# 才删，否则正文里用 # 做分隔的行会被整行误杀。
+_HASH_WM = re.compile(r"退出|阅读|模式|章节|缺失|本站|域名|记住|最新章节")
 
-def is_watermark_line(line):
+
+def is_watermark_line(line, idx=None, total=None):
+    """idx/total：该行在正文中的位置（从 0 起）。位置未知时按最保守的旧规则判。
+
+    位置参与判定是为了让「裸数字行」这条规则只在章首/章尾生效 —— 见 _BARE_NUM。"""
     if len(line) > 200:
         return False  # 水印行都是短行；超长行几乎必是正文（防分段失效时误杀全文）
     if any(p.search(line) for p in WATERMARK_LINE):
         return True
+    if "#" in line and line.count("#") >= 2:
+        if _HASH_SEP.match(line) or _HASH_WM.search(line):
+            return True
+    if _BARE_NUM.match(line):
+        # 位置未知（外部单独调用）时维持原行为；有位置时只在首尾 3 行内删
+        if idx is None or total is None:
+            return True
+        return idx < 3 or idx >= total - 3
     # 短行内出现 >=3 个导航词 = 标题+翻页按钮混合的导航条（正文不可能）
     hits = list(_NAV_WORDS.finditer(line))
     return len(hits) >= 3
@@ -1570,23 +1603,31 @@ def drop_latest_block(items):
             if mirror >= k * 0.8:
                 return items[k:], k
     # 形态2：前缀章号递减 + 尾部递增（跨页镜像的最新预览块）。
-    # 预览块展示的是"最新章节"，其章号必然全部大于本页正序列表的最大章号
-    # ——用这一条消解「预览末章 → 第1章」同样递减的边界歧义（大 k 优先）。
+    # 从小到大扫 k：真实边界是「递减前缀」结束的那一格，更小的 k 会让尾部仍含
+    # 预览块的递减段（尾部递增不成立），更大的 k 会顺手多删正文首章（递减容差
+    # 0.9 允许一次反转，k 一旦越过边界仍能通过校验）—— 所以最小命中值才是正解。
     nums = [_chap_num(c.get("title") or "") for c in items]
     if n >= 20:
-        for k in range(n // 3, 2, -1):
+        for k in range(3, n // 3 + 1):
             head, tailn = nums[:k], [x for x in nums[k:] if x]
             if any(x is None for x in head) or len(tailn) < 10:
                 continue
             hp = [(a, b) for a, b in zip(head, head[1:])]
-            # 只要求「前缀递减 + 尾部递增」这两条。原来还要求
-            # min(head) > max(tailn)（预览块章号必须全部大于本页正文），
-            # 但第一页正文只到第 20 章、预览块恰好也是第 10~20 章时章号范围重叠，
-            # 该条件不成立便把镜像块当成正文（shyixin 实测：首章变成「第20章」）。
-            if sum(1 for a, b in hp if a > b) / len(hp) < 0.9:
+            # 前缀必须严格递减（预览块里不会出现回涨），否则 k 还没走到边界。
+            if any(a <= b for a, b in hp):
                 continue
+            # 边界处必须掉头向下：预览块末章 > 正文首章。少了这条，k 落在预览块
+            # 中间时尾部仍含一小段递减，靠 0.95 的比例容差照样能蒙混过关。
+            if head[-1] <= tailn[0]:
+                continue
+            # 边界后的第一对必须已经在涨：k 少一格时，预览块的最后一个章号会作为
+            # 尾部首元素出现，它比后一个还大（第62章 → 第1章），据此挡掉。
+            if tailn[0] >= tailn[1]:
+                continue
+            # 尾部要几乎全程递增。这里比原来的 0.95 更紧：预览块越大，尾部递增段
+            # 在比例上越占优（第 1~60 章正序就能把 3 个逆序对稀释到 0.95 以上）。
             tp = list(zip(tailn, tailn[1:]))
-            if sum(1 for a, b in tp if a < b) / len(tp) >= 0.95:
+            if sum(1 for a, b in tp if a < b) / len(tp) >= 0.98:
                 return items[k:], k
     return items, 0
 

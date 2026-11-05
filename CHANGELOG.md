@@ -384,7 +384,8 @@ python scripts/import_book_sources.py --keyword 诡秘之主 --min-results 5
 
 ## 附录 B：已知限制与待办
 
-1. **结果上限 60 条**（`uniq[:60]`）：站点再多也不会增加总数，只会分散来源。
+1. ~~**结果上限 60 条**（`uniq[:60]`）：站点再多也不会增加总数，只会分散来源。~~
+   已解决（2026-11-05）：`max_results` 可配，端点支持 `?limit=`（≤300），网页台打满上限时给「显示更多」。
 2. **多页章节合并上限**：速读谷有章标题写「1 / 9」，但 `verify_content_pagination` 与 `fetch_chapter` 的 hops 上限是 6/8 页，9 页的章尾部可能仍缺。
 3. **禁忌书屋价值有限**：cool18.com/bbs4 是论坛结构，单独测试能返回 16 条，完整搜索里贡献 0 条。
 4. **已入库的书不会自动更新**：解析规则改进后，需手动「刷新目录(追更)」或「清缓存」。
@@ -399,3 +400,51 @@ python scripts/import_book_sources.py --keyword 诡秘之主 --min-results 5
 2. **本机有系统代理** `HTTP_PROXY=127.0.0.1:2427`，测本地接口需显式 `proxies=None`。
 3. **「请求成功但结果为空」优先怀疑编码**。errors 为空恰恰说明请求本身没问题，问题在解析后的过滤环节。
 4. **性能问题先分段计时，不要猜**。这次预验的瓶颈就与直觉相反：加并发无效，真凶是一个无锁的共享对象初始化。
+
+---
+
+# 2026-11-05：优化批次（OPTIMIZATION.md 14 项落地）
+
+> 对应 `OPTIMIZATION.md`（14 项风险清单）与 `FIXES.md`（逐项修复记录 FIX-01~FIX-16）
+> 记录原则同上：问题 → 根因 → 改动 → 验证
+
+## 摘要
+
+| 批次 | 项 | 核心问题 | 结果 |
+|---|---|---|---|
+| A 数据正确性 | §1-§3 | 种子沉淀死代码、缓存非原子写、半章被当完整章 | Reader 打开的书开始沉淀种子；半章不再永久化 |
+| B 吞吐 | §4-§6 | 全局 0.6s 节流、L3 单实例、体检串行 | 10 站搜索 6.0s → 约 1.6s；体检 4 路并发 |
+| C 容量 | §7-§10 | 缓存无上限、JOBS 不回收、缓存键两处各算 | 配额 500MB + 启动清理；JOBS TTL/上限；键统一 |
+| D 行为 | §11-§14 | 水印误杀数字行、60 条硬截断、SSE 超时耦合 | 数字行按位置判；结果可配 + 显示更多；预算解耦 |
+
+## 一、数据正确性（P0）
+
+1. **种子沉淀是死代码**（`engine/gateway.py:238-250`）：`from search import ...` 在包导入下必然 `ImportError`，又被 `except Exception: pass` 吞掉。改为先按 `engine.*` 包名导入、失败回退裸名，外层改为打印异常。后果修正：**通过 Reader 打开的书现在也会沉淀种子**，种子库恢复自动增长。
+2. **章节缓存非原子写**（`engine/gateway.py:335-345`）：`open(...,"w").write()` 中途被杀就留半截文件，而读取端「存在即返回」。改为 `.tmp` + `os.replace`。
+3. **半章被当完整章缓存**（`engine/gateway.py:301-334`）：正文分页任一页失败仍拼接已抓部分并落缓存。改为 `interrupted` 标志——照常返回给读者，但**不落缓存**，下次重读自愈；读取端另加 <50 字脏数据兜底删除。
+4. **`parse_doc` 只探 title 判乱码**（`autobs/autobs.py:231-245`）：无 title 或 title 为 ASCII 的中文页整体按 Latin-1 误解，「下一页」文案变 mojibake → 正文分页静默失效，每章只抓第一页。改为追加正文前 5 个文本节点再判。
+5. **`drop_latest_block` 多删 1~2 章**（`autobs/autobs.py:1580-1607`）：从大到小扫边界 + 0.9 递减容差，k 越过真实边界仍成立。改为从小到大扫 + 前缀严格递减 + 边界掉头 + 尾部递增 0.98。
+
+## 二、吞吐（P1）
+
+6. **全局 0.6s 节流**（`engine/fetcher.py:156-170`）：10 站并发被同一道闸门压成 6.0s，与「遮天 6.0s / 60 条」完全吻合。改为按 host 计时 + 先占位再睡（同站仍 ≥0.6s，跨站互不拖累）。
+7. **L3 单实例 + 全局锁**（`engine/fetcher.py:40-131`）：单次最坏 35s，串行化所有浏览器请求。改为 2 个标签页的池 + 等挑战硬上限 6s，取不到 tab 直接失败交给熔断。
+8. **体检逐本串行**（`server.py:589-654`）：10 本 = 40 个串行请求。改为 `ThreadPoolExecutor(4)` + 单本异常隔离 + 结果按书架顺序重排。
+
+## 三、容量与可观测（P2）
+
+9. **缓存无上限**：实测 8.5KB/章，1859 章 ≈ 16MB/本。新增 `cache_stats()` / `prune_cache()`、配置 `cache_max_mb`（默认 500）、启动时清理、接口 `GET /api/cache/stats`。
+10. **JOBS 永不回收**：加 `JOBS_TTL=1800` / `JOBS_MAX=20` / `_finish()` 统一打 `finished_at`。注意 `_prune_jobs(reserve=1)`——插入前裁到 19，插入后正好 20。
+11. **缓存键两处各算一遍**：抽出 `gateway.cache_path(bid, url)`，体检与 `fetch_chapter` 共用。
+12. **autobs 不是包**：新增 `autobs/__init__.py`，删除 `server.py` 指向不存在目录的死 `sys.path`。
+
+## 四、行为修正（P3）
+
+13. **水印误杀**（`autobs/autobs.py:1404-1450`）：`^\d{1,4}$` 与 `#.*#.*#` 会删掉正文里的数字行与含 # 的对白。改为裸数字仅首尾 3 行删、`#` 行需命中分隔线形态或水印语义。
+14. **结果 60 条硬截断**：`MAX_RESULTS` + `max_results` 参数 + 端点 `limit`（≤300）+ 网页台「显示更多」（打满上限才出现）。
+15. **SSE 超时耦合**（`server.py:400-440`）：`as_completed(timeout=45)` 会连已算完的结果一起丢。改为 `wait(FIRST_COMPLETED)` 轮询 + `SSE_TOTAL_BUDGET=60`，谁先回谁先推。
+
+## 验证
+
+`python -m pytest tests/ -q` → **81 passed, 3 skipped**。新增测试：
+`tests/test_gateway_cache.py`(4)、`tests/test_fetcher_throttle.py`(3)、`tests/test_browser_pool.py`(3)、`tests/test_cache_quota.py`(3)、`tests/test_server_jobs.py`(4)，`tests/test_units.py` 追加 4 条水印用例。

@@ -51,6 +51,32 @@ def test_watermark_long_line_protected():
     assert not is_watermark_line(long_line)
 
 
+def test_watermark_bare_number_only_at_edges():
+    """裸数字行只在章首/章尾 3 行内算水印；正文中间的小节号要保留。"""
+    assert is_watermark_line("3", 0, 40)
+    assert is_watermark_line("3", 37, 40)
+    assert not is_watermark_line("3", 10, 40)
+    assert not is_watermark_line("12", 20, 40)
+
+
+def test_watermark_hash_line_needs_semantics():
+    """带 # 的行必须同时有「退出/阅读/模式」这类语义才删，
+    否则正文里拿 # 做分隔的行会被整行误杀。"""
+    assert is_watermark_line("如章节缺失请退#出#阅#读#模#式", 10, 40)
+    assert is_watermark_line("#=#=#=#", 10, 40)          # 纯装饰分隔线
+    assert not is_watermark_line("他写下：#1 号方案#，又划掉了。", 10, 40)
+
+
+def test_extract_content_text_keeps_middle_number_line():
+    """正文中间独立成行的数字（小节号/诗行）不能被水印规则吃掉。"""
+    para = "段落内容内容内容内容内容内容内容内容"
+    html = "<div>" + "<br>".join([para] * 5 + ["7"] + [para] * 5) + "</div>"
+    import lxml.html
+    doc = lxml.html.fromstring(html)
+    out = extract_content_text(doc)
+    assert "7" in out.split("\n"), out
+
+
 # ---- _cut_nav_prefix：导航与正文同行 ----
 def test_cut_nav_mixed_line():
     line = "手机访问番外5你是我的（第1页）上一章章节目录保存书签下一章“小黎，你哥来接你啦。”隔壁张姐的座位在他旁边。"

@@ -13,6 +13,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import sys
 import threading
 import time
@@ -59,6 +60,60 @@ def _url_hash(url):
     """章节 URL 哈希：作为缓存键。目录刷新后章节序号可能漂移，
     按 URL 命中才能保证不张冠李戴。"""
     return hashlib.md5((url or "").encode("utf-8")).hexdigest()[:16]
+
+
+def cache_path(bid, url):
+    """章节缓存文件路径（公共入口）。
+
+    缓存键算法只允许有这一份实现：体检、导出、外部脚本都必须走这里，
+    否则一旦换算法（加盐/换目录），别的调用点会静默读不到缓存——不报错，
+    只是每次都实抓，最难发现的那种退化。
+    """
+    return os.path.join(CACHE_DIR, bid, _url_hash(url) + ".txt")
+
+
+def cache_stats():
+    """章节缓存总体情况：{"total": 字节数, "books": [{id,size,files,last_access}]}。
+
+    实测约 8.5KB/章：一本 1859 章的书全缓存 ≈ 16MB，20 本 ≈ 320MB，
+    所以需要一个全局视图，不能只有「按书清理」。"""
+    out = {"total": 0, "books": []}
+    if not os.path.isdir(CACHE_DIR):
+        return out
+    for bid in os.listdir(CACHE_DIR):
+        d = os.path.join(CACHE_DIR, bid)
+        if not os.path.isdir(d):
+            continue
+        size, files, last = 0, 0, 0.0
+        for root, _dirs, fs in os.walk(d):
+            for f in fs:
+                p = os.path.join(root, f)
+                try:
+                    st = os.stat(p)
+                except OSError:
+                    continue
+                size += st.st_size
+                files += 1
+                last = max(last, st.st_mtime)
+        out["total"] += size
+        out["books"].append({"id": bid, "size": size, "files": files,
+                             "last_access": last})
+    out["books"].sort(key=lambda x: x["last_access"])
+    return out
+
+
+def prune_cache(max_bytes=500 * 1024 * 1024):
+    """超配额时按「最久没读过」整本清缓存（书架记录与阅读进度不动）。"""
+    st = cache_stats()
+    freed, removed = 0, []
+    for b in st["books"]:
+        if st["total"] - freed <= max_bytes:
+            break
+        shutil.rmtree(os.path.join(CACHE_DIR, b["id"]), ignore_errors=True)
+        freed += b["size"]
+        removed.append(b["id"])
+    return {"freed": freed, "removed": removed, "before": st["total"],
+            "limit": max_bytes}
 
 
 class BookStore:
@@ -159,7 +214,6 @@ class BookStore:
         """清空一本书的章节缓存（书架记录保留，下次阅读重新抓取）。"""
         import shutil
         shutil.rmtree(os.path.join(CACHE_DIR, bid), ignore_errors=True)
-
     def get(self, bid):
         return self._books.get(bid)
 
@@ -236,9 +290,16 @@ class BookStore:
         return b, ""
 
     def _try_sediment(self, bid):
+        # 兼容两种运行方式：包内导入（server.py 走的路径）与扁平导入（autobs 单文件场景）。
+        # 原来只写 `from search import ...`，而 search 在 engine 包内、根目录不在其父路径上，
+        # ImportError 被外层 except 吞掉 —— 从 Reader 打开的书从未沉淀过一个种子。
         try:
+            from engine.search import maybe_add_seed
+            from engine.fetcher import LayeredFetcher
+        except ImportError:
             from search import maybe_add_seed
             from fetcher import LayeredFetcher
+        try:
             b = self.get(bid)
             if not b or not b.get("src"):
                 return
@@ -246,8 +307,9 @@ class BookStore:
             got = maybe_add_seed(b["src"], solo)
             if got:
                 print("[seed] 沉淀新种子: %s" % got.get("name"))
-        except Exception:
-            pass
+        except Exception as e:
+            # 沉淀是尽力而为，但不能静默：日志里留一行，出问题才查得到
+            print("[seed] 沉淀失败 %s: %r" % (bid, e))
 
     def fetch_chapter(self, bid, n, fetcher, prefetch=False):
         """抓第 n 章（1-based），返回正文文本（已清洗水印）。失败返回 None。
@@ -261,7 +323,7 @@ class BookStore:
         ch = b["chapters"][n - 1]
         d = os.path.join(CACHE_DIR, bid)
         os.makedirs(d, exist_ok=True)
-        cpath = os.path.join(d, _url_hash(ch["url"]) + ".txt")
+        cpath = cache_path(bid, ch["url"])
         hit = False
         if os.path.exists(cpath):
             hit = True
@@ -270,6 +332,14 @@ class BookStore:
             except Exception:
                 hit = False
                 text = None
+            # 损坏兜底：正常章节不会少于 50 字。小于这个数说明上次是写到一半
+            # 被打断（进程被杀/磁盘满），删掉重抓，否则会永久返回半截内容。
+            if hit and len(text.strip()) < 50:
+                hit = False
+                try:
+                    os.remove(cpath)
+                except Exception:
+                    pass
             if hit:
                 if not prefetch:
                     self._spawn_prefetch(bid, n, fetcher)
@@ -282,15 +352,19 @@ class BookStore:
         # 只看文案会误以为本章已结束，导致每章只抓到一半正文。
         all_chs = b.get("chapters") or []
         nxt_ch_abs = norm_url(all_chs[n]["url"]) if 0 <= n < len(all_chs) else ""
+        interrupted = False   # 分页因抓取失败中断（区别于「正常抓到末页」）
         while cu and hops < 8:
             rr = fetcher.get(cu, referer=b.get("list_url"))
             if rr is None:
+                interrupted = True
                 break
             dd = parse_doc(rr)
             if dd is None:
+                interrupted = True
                 break
             got = dd.xpath(src.get("content_xpath", ""))
             if len(got) != 1:
+                interrupted = True
                 break
             parts.append(extract_content_text(got[0]))
             if not src.get("enable_content_next"):
@@ -308,10 +382,21 @@ class BookStore:
         if len(text) < 50:
             return None
         text = _filter_domain_watermark(text, ch["url"])
+        if interrupted:
+            # 分页没抓全：正文照常返回（用户能读），但不落缓存 —— 下次重读会重抓，
+            # 直到抓全为止。宁可多抓一次，也不要让半章永久躺在缓存里。
+            return text
+        tmp = cpath + ".tmp"
         try:
-            open(cpath, "w", encoding="utf-8").write(text)
+            with open(tmp, "w", encoding="utf-8") as fp:
+                fp.write(text)
+            os.replace(tmp, cpath)   # 同卷原子替换，避免半截文件被当成有效缓存
         except Exception:
-            pass
+            try:
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+            except Exception:
+                pass
         if not prefetch:
             self._spawn_prefetch(bid, n, fetcher)
         return text
