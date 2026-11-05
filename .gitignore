@@ -5,6 +5,7 @@ books/
 server.log
 server.log.old
 config.json
+bs_gateway.json.bak
 
 # Python
 __pycache__/
@@ -12,3 +13,6 @@ __pycache__/
 
 # 测试夹具（含小说正文，版权属原站；用 scripts/build_fixtures.py 重新采集）
 tests/fixtures/
+
+# 本地 AI 助手记忆目录（个人笔记，与项目无关）
+.workbuddy/

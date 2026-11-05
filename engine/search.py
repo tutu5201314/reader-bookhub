@@ -5,21 +5,61 @@ import os
 import re
 import sys
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import quote, urljoin
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "autobs"))
 from autobs import parse_doc, norm_space  # noqa: E402
 
+# 简繁转换（可选依赖）：繁体书站（如 biquge.tw）的书名与简体关键词
+# 字形不同，不做归一会被相关度过滤掉。未安装 zhconv 时自动降级为不转换。
+try:
+    from zhconv import convert as _zh_convert
+except ImportError:
+    _zh_convert = None
+
 SEEDS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "seeds.json")
+
+_FOLD_CACHE = {}
+
+
+def _fold_cjk(s):
+    """简繁归一化（繁体 -> 简体），带缓存。无 zhconv 时原样返回。"""
+    if not s:
+        return s
+    hit = _FOLD_CACHE.get(s)
+    if hit is not None:
+        return hit
+    out = s
+    if _zh_convert is not None:
+        try:
+            out = _zh_convert(s, "zh-cn")
+        except Exception:
+            out = s
+    if len(_FOLD_CACHE) < 8192:   # 防止长时间运行无限增长
+        _FOLD_CACHE[s] = out
+    return out
 
 
 def load_seeds():
+    """读取种子站。带 disabled 标记的保留在文件里（便于恢复），但不参与搜索。"""
     with open(SEEDS_PATH, encoding="utf-8") as fp:
-        return json.load(fp)
+        seeds = json.load(fp)
+    return [s for s in seeds if not s.get("disabled")]
 
 
-def _search_site(fetcher, seed, keyword):
+def _search_site(fetcher, seed, keyword, site_ms=None):
+    """单站搜索（计时包装）。site_ms 可选：回填该站耗时（秒）供日志统计。"""
+    t0 = time.time()
+    try:
+        return _search_site_impl(fetcher, seed, keyword)
+    finally:
+        if site_ms is not None:
+            site_ms[seed["name"]] = time.time() - t0
+
+
+def _search_site_impl(fetcher, seed, keyword):
     """单站搜索，返回 [{'title','url','site'}] 或 []（失败）。"""
     charset = "gbk" if seed.get("charset") == "gbk" else "utf-8"
     kw = quote(keyword.encode(charset, errors="ignore"))
@@ -59,9 +99,11 @@ def _search_site(fetcher, seed, keyword):
 
 
 def _relevance(keyword, title):
-    """精确匹配 > 包含关键词 > 关键词包含标题 > 其他。"""
-    key = re.sub(r"\s+", "", keyword)
-    t = re.sub(r"\s+", "", title)
+    """精确匹配 > 包含关键词 > 关键词包含标题 > 其他。
+    比较前做简繁归一：繁体站（biquge.tw）的书名与简体关键词字形不同，
+    不归一的话会被判为「不相关」而在噪音治理阶段整批丢弃。"""
+    key = _fold_cjk(re.sub(r"\s+", "", keyword))
+    t = _fold_cjk(re.sub(r"\s+", "", title))
     if not key:
         return 3
     if t == key:
@@ -86,16 +128,45 @@ def split_query(q):
     return q, ""
 
 
-def aggregate_search(fetcher, keyword, seeds=None, timeout_per_site=40, web=True):
-    """三层搜索：种子站直搜（并发）+ 搜索引擎发现层（Bing）。
+def _web_discover_safe(fetcher, keyword, author, stats):
+    """在线程里跑发现层：import 与异常都收敛在内部，返回 (结果, 错误串)。
+
+    供 aggregate_search 与种子站并行调用——异常不能往外抛，
+    否则一个线程的失败会拖垮整次搜索。"""
+    try:
+        try:
+            from engine.websearch import web_discover
+        except ImportError:
+            from websearch import web_discover
+        return web_discover(fetcher, keyword, author=author, stats=stats), ""
+    except Exception as e:
+        return [], str(e)[:80]
+
+
+def aggregate_search(fetcher, keyword, seeds=None, timeout_per_site=40, web=True,
+                     stats=None):
+    """三层搜索：种子站直搜（并发）+ 搜索引擎发现层（Bing / 百度兜底）。
     输入支持『书名 作者』联合查询：作者用于结果过滤排序，搜索用书名。
-    返回扁平列表：作者匹配的最前，其余按相关度。"""
+    返回扁平列表：作者匹配的最前，其余按相关度。
+
+    stats：可选 dict，回填各阶段耗时（秒）——seed / sites / bing / baidu /
+    verify / total，由调用方决定是否落日志（不传则零开销）。"""
+    t_start = time.time()
     keyword, want_author = split_query(keyword)
     seeds = seeds or load_seeds()
     results = []
     errors = []
+    site_ms = {}
+    # 发现层与种子站并行发起：两层互不依赖，串行会让总时长变成两者之和。
+    # 冷门书（Bing 无结果、要靠百度兜底）发现层要 10s+，种子的 3s 完全被掩盖。
+    web_pool = web_fut = None
+    if web:
+        web_pool = ThreadPoolExecutor(max_workers=1)
+        web_fut = web_pool.submit(_web_discover_safe, fetcher, keyword,
+                                  want_author, stats)
+    t_seed = time.time()
     with ThreadPoolExecutor(max_workers=len(seeds) or 1) as ex:
-        futs = {ex.submit(_search_site, fetcher, s, keyword): s for s in seeds}
+        futs = {ex.submit(_search_site, fetcher, s, keyword, site_ms): s for s in seeds}
         try:
             for fut in as_completed(futs, timeout=timeout_per_site * 2):
                 seed = futs[fut]
@@ -113,6 +184,9 @@ def aggregate_search(fetcher, keyword, seeds=None, timeout_per_site=40, web=True
                         pass
                 elif not fut.done():
                     errors.append({"site": seed["name"], "error": "超时"})
+    if stats is not None:
+        stats["seed"] = time.time() - t_seed
+        stats["sites"] = site_ms
     for r_ in results:
         r_["src"] = "seed"
     def _rank(x):
@@ -143,17 +217,18 @@ def aggregate_search(fetcher, keyword, seeds=None, timeout_per_site=40, web=True
         capped.append(r_)
     results = capped
 
-    # 发现层：Bing 全网找新站（种子站没有的书靠这层覆盖）
+    # 发现层：Bing 全网找新站（种子站没有的书靠这层覆盖）。
+    # 结果在上面已并发开始，这里只等它返回。
     web_results = []
-    if web:
+    if web_fut is not None:
         try:
-            try:
-                from engine.websearch import web_discover
-            except ImportError:
-                from websearch import web_discover
-            web_results = web_discover(fetcher, keyword, author=want_author)
+            web_results, web_err = web_fut.result()
+            if web_err:
+                errors.append({"site": "web", "error": web_err})
         except Exception as e:
             errors.append({"site": "web", "error": str(e)[:80]})
+        finally:
+            web_pool.shutdown(wait=False)
 
     # 联合查询（带作者）时，发现层结果与种子结果统一按作者匹配度重排，
     # 否则目标书（常来自发现层）会整体沉底
@@ -183,6 +258,8 @@ def aggregate_search(fetcher, keyword, seeds=None, timeout_per_site=40, web=True
         seen_url.add(k)
         seen_root.add(root)
         uniq.append(r_)
+    if stats is not None:
+        stats["total"] = time.time() - t_start
     return uniq[:60], errors
 
 

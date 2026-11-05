@@ -6,3 +6,6 @@ fastapi>=0.100
 uvicorn>=0.23
 cloudscraper>=1.2.71
 DrissionPage>=4.0
+# 简繁归一：繁体书站（笔趣阁tw 等）的书名与简体关键词字形不同，
+# 不做转换会被相关度过滤掉。未安装时程序自动降级为不转换。
+zhconv>=1.4

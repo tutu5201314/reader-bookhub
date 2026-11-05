@@ -19,7 +19,8 @@ import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "autobs"))
 from autobs import (parse_doc, norm_url, norm_space, clean_text,  # noqa: E402
-                    extract_content_text, resolve_book, find_next_page_anchor)
+                    extract_content_text, resolve_book,
+                    find_next_page_anchor, find_content_next_anchor)
 from urllib.parse import urljoin
 
 DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data")
@@ -276,6 +277,11 @@ class BookStore:
         src = b.get("src") or {}
         parts = []
         cu, seen, hops = ch["url"], set(), 0
+        # 真正的下一章地址：用来把「下一章」文案背后的同章续页区分出来。
+        # 有的站（ddkshu）每章拆成 (1)页/(2)页，第 1 页的「下一章」指向 9_2.html，
+        # 只看文案会误以为本章已结束，导致每章只抓到一半正文。
+        all_chs = b.get("chapters") or []
+        nxt_ch_abs = norm_url(all_chs[n]["url"]) if 0 <= n < len(all_chs) else ""
         while cu and hops < 8:
             rr = fetcher.get(cu, referer=b.get("list_url"))
             if rr is None:
@@ -289,7 +295,7 @@ class BookStore:
             parts.append(extract_content_text(got[0]))
             if not src.get("enable_content_next"):
                 break
-            nxt, _ = find_next_page_anchor(dd, rr.url)
+            nxt, _ = find_content_next_anchor(dd, rr.url, nxt_ch_abs)
             if nxt is None:
                 break
             nu = urljoin(rr.url, nxt.get("href"))
@@ -360,16 +366,20 @@ def _filter_domain_watermark(text, page_url):
 
 def render_search_page(results, base):
     """搜索结果页：结构与 GW_XPATHS 对齐。results: [{id,title,author,site}]
-    链接带 ?src=站点 —— Reader 的"主页"列由此可辨来源（查询参数不影响路由）。"""
+
+    链接必须是纯 ASCII：Reader 把 href 原样保存、原样放进 HTTP 请求行，
+    不做二次编码。任何非 ASCII 字符（例如曾用过的 ?src=中文站名）都会让
+    uvicorn/h11 直接返回 400 Bad Request，Reader 侧表现为
+    「http 状态码错误。可能书源网站已更新」。站点名改由 bh-site 单独展示，
+    信息不丢，链接也只保留路由必需的部分。"""
     rows = []
     for r in results:
-        src = ("?src=" + (r["site"] or "").replace(" ", "")) if r.get("site") else ""
         rows.append(
             "<div class='bh-result'>"
-            "<a class='bh-name' href='%s/g/book/%s%s'>%s</a>"
+            "<a class='bh-name' href='%s/g/book/%s'>%s</a>"
             "<span class='bh-site'>%s</span>"
             "<span class='bh-author'>%s</span>"
-            "</div>" % (base, r["id"], src, _esc(r["title"]), _esc(r["site"] or ""),
+            "</div>" % (base, r["id"], _esc(r["title"]), _esc(r["site"] or ""),
                         _esc(r.get("author") or "")))
     body = "\n".join(rows) or "<div class='bh-empty'>没有找到相关书籍</div>"
     return "<html><head><meta charset='utf-8'></head><body>\n%s\n</body></html>" % body

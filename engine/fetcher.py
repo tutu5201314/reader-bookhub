@@ -188,12 +188,13 @@ class LayeredFetcher:
         return True
 
     def _req(self, method, url, data=None, referer=None, force_layer=None,
-             quick=False):
+             quick=False, allow_l2=True, timeout=8):
         # 熔断检查：该站冷却中直接快速失败
         if self._host_blocked(url):
             return None
         if quick:
-            return self._req_quick(method, url, data, referer)
+            return self._req_quick(method, url, data, referer,
+                                   allow_l2=allow_l2, timeout=timeout)
         self._throttle()
         headers = {}
         if referer:
@@ -208,21 +209,42 @@ class LayeredFetcher:
             self._host_fail(url)
         return result
 
-    def _req_quick(self, method, url, data, referer):
-        """快速模式：单次请求 8s 超时，失败即 None（体检等场景用，
-        不做重试/分层升级，保证批量探测的时效）。"""
+    def _req_quick(self, method, url, data, referer, allow_l2=True, timeout=8):
+        """快速模式：L1 单次请求（默认 8s 超时）；失败再试一次 cloudscraper，不走 L3。
+
+        原来完全不做分层升级，遇到 Cloudflare 站点（笔趣阁tw）L1 稳定 403，
+        体检的站点探活与章节快抓就会全线判死（实测：目录页/章节页全 None）。
+        补一次 L2 兜底，代价约 1s，仍远快于完整链路。
+
+        allow_l2=False 用于"批量预验候选页"场景：那里只需判断标题对不对，
+        死站直接跳过即可。而 cloudscraper 首次 create_scraper 有秒级初始化开销，
+        且 _scraper 是共享实例、无锁，多个候选并发进来会各建一次互相争抢
+        —— 实测 9 个候选的预验因此从 5s 拖到 14.6s。"""
         headers = {}
         if referer:
             headers["Referer"] = referer
         if isinstance(data, (bytes, str)):
             headers["Content-Type"] = "application/x-www-form-urlencoded"
         try:
-            r = self.s.get(url, headers=headers, timeout=8) if method == "GET"                 else self.s.post(url, data=data, headers=headers, timeout=8)
+            r = self.s.get(url, headers=headers, timeout=timeout) if method == "GET" \
+                else self.s.post(url, data=data, headers=headers, timeout=timeout)
             if self._ok(r):
                 self._host_ok(url)
                 return r
         except requests.RequestException:
             pass
+        if allow_l2 and cloudscraper is not None and method == "GET":
+            try:
+                if self._scraper is None:
+                    self._scraper = cloudscraper.create_scraper(
+                        browser={"custom": UA[:120]})
+                r = self._scraper.get(url, headers=headers, timeout=12)
+                if self._ok(r):
+                    self.layer_stats["L2"] += 1
+                    self._host_ok(url)
+                    return r
+            except Exception:
+                pass
         return None
 
     def _req_layers(self, method, url, data, headers, referer, force_layer):

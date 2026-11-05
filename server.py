@@ -6,6 +6,7 @@
 import json
 import os
 import re
+import socket
 import sys
 import threading
 import time
@@ -14,11 +15,13 @@ import uuid
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "autobs"))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
 from fastapi import FastAPI, Request, Query
-from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, StreamingResponse
 
 from engine.fetcher import LayeredFetcher
-from engine.search import aggregate_search
+from engine.search import aggregate_search, load_seeds, _search_site, _relevance
 from engine import gateway as gw
 from autobs import resolve_book
 
@@ -28,7 +31,11 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(BASE_DIR, "config.json")
 DEF_CONFIG = {
     "host": "127.0.0.1",
-    "port": 80,  # 必须是 80：Reader 的网络库不支持带端口的 URL
+    # 主端口：网页台 + 全部 API。默认 8787，被占用时自动向后顺延。
+    "port": 8787,
+    # 网关端口：优先给 Reader 用（Reader 的网络库对带端口的 URL 兼容性差）。
+    # 该端口空闲则额外起一个监听；被占用则自动降级，Reader 改走主端口地址。
+    "gateway_port": 80,
     "reader_dir": os.path.join(BASE_DIR, "books"),  # txt 导出目录，可在 config.json 改
     "headless": True,
 }
@@ -51,7 +58,157 @@ try:
 except Exception:
     pass
 
-GW_BASE = ("http://%s" % config["host"]) if config["port"] == 80 else ("http://%s:%d" % (config["host"], config["port"]))
+_LOG_LOCK = threading.Lock()
+
+
+def _log_line(msg):
+    """统一日志出口：带时间戳，同时写控制台与 server.log。
+    搜索是长耗时链路，落到文件才能事后复盘，光打控制台窗口一关就没了。"""
+    line = "[%s] %s" % (time.strftime("%Y-%m-%d %H:%M:%S"), msg)
+    try:
+        print(line, flush=True)
+    except Exception:
+        pass
+    try:
+        with _LOG_LOCK:
+            if os.path.exists(LOG_PATH) and os.path.getsize(LOG_PATH) > 1024 * 1024:
+                os.replace(LOG_PATH, LOG_PATH + ".old")
+            with open(LOG_PATH, "a", encoding="utf-8") as fp:
+                fp.write(line + "\n")
+    except Exception:
+        pass
+
+
+def _log_search(keyword, n_results, n_errors, total, stats, source="api"):
+    """搜索日志：一行摘要 + 一行阶段耗时。
+
+    摘要回答「这次搜到了什么」，阶段耗时回答「时间花在哪」——
+    种子站并发 / Bing / 百度兜底 / 候选预验，哪一段慢一眼能看到。"""
+    _log_line("[search:%s] %r -> %d 条 / %d 错误 / 总 %.1fs"
+              % (source, keyword, n_results, n_errors, total))
+    sites = stats.get("sites") or {}
+    site_txt = ""
+    if sites:
+        parts = ["%s %.1fs" % (k, v)
+                 for k, v in sorted(sites.items(), key=lambda kv: -kv[1])
+                 if v >= 0.05]
+        if parts:
+            site_txt = " (%s)" % ", ".join(parts)
+    # 流式搜索里种子站与发现层并发，"种子站总耗时"没有意义，缺省显示 -
+    seed_txt = ("%.1fs" % stats["seed"]) if "seed" in stats else "-"
+    _log_line("[search:%s]   └ 种子站 %s%s | Bing %.1fs | 百度 %.1fs | 预验 %.1fs"
+              % (source, seed_txt, site_txt,
+                 stats.get("bing", 0.0), stats.get("baidu", 0.0),
+                 stats.get("verify", 0.0)))
+
+def _fmt_base(port):
+    """端口为 80 时省略端口号（Reader 对无端口地址兼容性最好），否则显式带上。"""
+    return ("http://%s" % config["host"]) if port == 80 \
+        else ("http://%s:%d" % (config["host"], port))
+
+
+# 网关对外地址：启动时按 gateway_port 的实际可用性确定（见文件末尾 __main__）
+GW_PRIMARY = _fmt_base(config["port"])
+
+
+def gw_base(req=None):
+    """生成网关绝对地址。
+
+    有请求上下文时以请求实际 Host 为准——同一进程可能同时监听 80 与 8787，
+    按请求生成才能保证页面里的链接指回用户正在访问的那个端口。"""
+    if req is not None:
+        try:
+            return str(req.base_url).rstrip("/")
+        except Exception:
+            pass
+    return GW_PRIMARY
+
+
+def _port_available(host, port):
+    """探测端口能否本地绑定。不设 SO_REUSEADDR：Windows 下该选项会
+    让已被占用的端口仍返回绑定成功，导致误判。"""
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        s.bind((host, port))
+        return True
+    except OSError:
+        return False
+    finally:
+        s.close()
+
+
+def _pick_port(host, start, tries=20):
+    """从 start 起找一个可绑定的端口，避免端口被占就整个服务起不来。"""
+    for p in range(start, start + tries):
+        if _port_available(host, p):
+            return p
+    return start  # 全不可用则交回原值，让 uvicorn 报出真实错误
+
+
+# 网关书源兜底模板：仅当 bs_gateway.json 缺失或损坏时使用
+_BS_TEMPLATE = {
+    "book_sources": [{
+        "title": "bookhub网关",
+        "host": "",
+        "query_url": "",
+        "query_method": 0,
+        "query_params": "",
+        "query_charset": 1,
+        "book_name_xpath": "//a[@class='bh-name']",
+        "book_mainpage_xpath": "//a[@class='bh-name']/@href",
+        "book_author_xpath": "//span[@class='bh-author']",
+        "enable_chapter_page": 0,
+        "chapter_page_xpath": "",
+        "chapter_title_xpath": "//a[@class='bh-chapter']",
+        "chapter_url_xpath": "//a[@class='bh-chapter']/@href",
+        "enable_chapter_next": 0,
+        "chapter_next_url_xpath": "",
+        "chapter_next_keyword_xpath": "",
+        "chapter_next_keyword": "",
+        "content_xpath": "//div[@id='bh-content']",
+        "enable_content_next": 0,
+        "content_next_url_xpath": "",
+        "content_next_keyword_xpath": "",
+        "content_next_keyword": "",
+        "content_filter_type": 0,
+        "content_filter_keyword": "",
+    }]
+}
+
+
+def _sync_gateway_source(base):
+    """让 bs_gateway.json 的地址跟随实际端口。
+
+    只改写 host / query_url 两个字段，用户调整过的 xpath 等其余配置原样保留；
+    端口没变就不触碰文件。改写前把原文件留一份 .bak。"""
+    path = os.path.join(BASE_DIR, "bs_gateway.json")
+    data = None
+    if os.path.exists(path):
+        try:
+            with open(path, encoding="utf-8") as fp:
+                data = json.load(fp)
+        except Exception:
+            data = None
+    if not isinstance(data, dict) or not data.get("book_sources"):
+        data = json.loads(json.dumps(_BS_TEMPLATE))
+    want_query = base + "/g/search?q=%s"
+    changed = False
+    for src in data["book_sources"]:
+        if src.get("host") != base:
+            src["host"] = base
+            changed = True
+        if src.get("query_url") != want_query:
+            src["query_url"] = want_query
+            changed = True
+    if changed:
+        try:
+            if os.path.exists(path):
+                os.replace(path, path + ".bak")
+            with open(path, "w", encoding="utf-8") as fp:
+                json.dump(data, fp, ensure_ascii=False, indent=2)
+        except Exception as e:
+            print("[bookhub] 书源文件更新失败：%s" % e)
+    return path
 
 app = FastAPI(title="bookhub")
 fetcher = LayeredFetcher(debug=False, headless=config.get("headless", True))
@@ -73,7 +230,7 @@ def _new_job(kind):
 def _job_log(job, msg):
     if job is not None:
         job["log"].append("[%s] %s" % (time.strftime("%H:%M:%S"), msg))
-    print("[bookhub] %s" % msg)
+    _log_line("[bookhub] %s" % msg)
 
 
 def _run_resolve_job(job, bid, url, want_txt):
@@ -86,7 +243,7 @@ def _run_resolve_job(job, bid, url, want_txt):
         job["progress"] = 60
         _job_log(job, "解析完成：%d 章，Reader直连：%s" % (
             b["chapter_count"], "可" if b.get("reader_ok") else "不可（走网关/txt）"))
-        out = {"book": _book_info(b), "gateway_url": "%s/g/book/%s" % (GW_BASE, bid),
+        out = {"book": _book_info(b), "gateway_url": "%s/g/book/%s" % (gw_base(), bid),
                "reader_ok": b.get("reader_ok")}
         # 生成独立书源文件（可直连站直接导入 Reader 用）
         bs_path = os.path.join(BASE_DIR, "out", "bs_%s.json" % re.sub(r"[^\w]+", "_", b.get("site") or bid))
@@ -149,13 +306,15 @@ def _book_info(b):
 
 @app.get("/api/config")
 def api_config():
-    return {"base": GW_BASE, "reader_dir": config["reader_dir"],
+    return {"base": gw_base(), "reader_dir": config["reader_dir"],
             "xpaths": gw.GW_XPATHS, "layer_stats": fetcher.layer_stats}
 
 
 @app.get("/api/search")
 def api_search(q: str = Query(..., min_length=1)):
-    results, errors = aggregate_search(fetcher, q)
+    t0 = time.time()
+    stats = {}
+    results, errors = aggregate_search(fetcher, q, stats=stats)
     results = _merge_shelf(q, results)
     out = []
     for r in results:
@@ -163,7 +322,89 @@ def api_search(q: str = Query(..., min_length=1)):
             bid = store.register(r["url"], title=r["title"], site=r["site"])
             r = {"id": bid, **r}
         out.append(r)
+    _log_search(q, len(out), len(errors), time.time() - t0, stats, source="api")
     return {"results": out, "errors": errors}
+
+
+@app.get("/api/search/stream")
+def api_search_stream(q: str = Query(..., min_length=1)):
+    """流式搜索（SSE）：种子站与发现层并发，谁先出结果就先推给前端。
+
+    前端用 EventSource 接收，逐批 append，不必等最慢的那个源。
+    事件：{"type":"batch","site":..,"src":..,"items":[..],"elapsed":..}
+          {"type":"status","msg":..}
+          {"type":"done","total":..,"elapsed":..}"""
+    def _sse(obj):
+        return "data: %s\n\n" % json.dumps(obj, ensure_ascii=False)
+
+    def gen():
+        t0 = time.time()
+        seen = set()
+        total = 0
+        site_ms = {}
+        stats = {}
+
+        def _pack(raw, src):
+            """按相关度过滤 + 同 URL 去重 + 注册书籍 id，前端拿到即可渲染。"""
+            out = []
+            for r in raw or []:
+                url = (r.get("url") or "").rstrip("/")
+                if not url or url in seen:
+                    continue
+                if _relevance(q, r.get("title") or "") >= 3:
+                    continue
+                seen.add(url)
+                bid = store.register(r["url"], title=r.get("title") or "",
+                                     site=r.get("site") or "")
+                out.append({"id": bid, "title": r.get("title") or "",
+                            "author": r.get("author") or "",
+                            "site": r.get("site") or "", "url": r["url"],
+                            "src": src})
+            return out
+
+        try:
+            from engine.websearch import web_discover
+        except ImportError:
+            from websearch import web_discover
+
+        seeds = load_seeds()
+        ex = ThreadPoolExecutor(max_workers=len(seeds) + 1)
+        try:
+            # 种子站与发现层同池并发：慢站不再拖住整体，先完成的先推
+            seed_futs = {ex.submit(_search_site, fetcher, s, q, site_ms): s
+                         for s in seeds}
+            web_fut = ex.submit(web_discover, fetcher, q, stats=stats)
+            for fut in as_completed(list(seed_futs) + [web_fut], timeout=45):
+                if fut is web_fut:
+                    label, src = "全网发现", "web"
+                else:
+                    label, src = seed_futs[fut]["name"], "seed"
+                try:
+                    raw = fut.result()
+                except Exception as e:
+                    yield _sse({"type": "status",
+                                "msg": "%s 失败：%s" % (label, str(e)[:40])})
+                    continue
+                items = _pack(raw, src)
+                if items:
+                    total += len(items)
+                    yield _sse({"type": "batch", "site": label, "src": src,
+                                "items": items,
+                                "elapsed": round(time.time() - t0, 1)})
+        except TimeoutError:
+            yield _sse({"type": "status", "msg": "部分来源超时，已返回现有结果"})
+        finally:
+            ex.shutdown(wait=False)   # 不等卡死的源，避免拖住本次请求
+
+        stats["sites"] = site_ms
+        stats["total"] = time.time() - t0
+        _log_search(q, total, 0, stats["total"], stats, source="stream")
+        yield _sse({"type": "done", "total": total,
+                    "elapsed": round(stats["total"], 1)})
+
+    return StreamingResponse(
+        gen(), media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
 
 @app.post("/api/resolve")
@@ -303,10 +544,13 @@ def api_healthcheck():
                         except Exception:
                             text = None
                     checked = True
-                    if text is None and idx == 0:
+                    # 三章都实抓：没缓存就抓一次（实测 0.2~0.7s/章，整本多花不到 1s）。
+                    # 原来只抓首章，中/末章没缓存时显示「0字 ✓」，容易被误读成抓取失败。
+                    if text is None:
                         text = _quick_chapter(b2, ch, fetcher)
                     if text is None:
-                        # 中/末章未读无缓存属正常；首章抓不到才是问题
+                        # 首章抓不到说明这本书可能不可用；中/末章失败多为站点瞬时波动，
+                        # 不参与整体判定，避免一次网络抖动就把整本判红
                         checked = idx == 0
                         item = {"idx": idx + 1, "title": ch["title"][:20],
                                 "len": 0,
@@ -385,8 +629,10 @@ def _merge_shelf(keyword, results):
 
 
 @app.get("/g/search", response_class=HTMLResponse)
-def g_search(q: str = Query(...)):
-    results, _ = aggregate_search(fetcher, q)
+def g_search(request: Request, q: str = Query(...)):
+    t0 = time.time()
+    stats = {}
+    results, errs = aggregate_search(fetcher, q, stats=stats)
     results = _merge_shelf(q, results)
     items = []
     for r in results:
@@ -396,17 +642,18 @@ def g_search(q: str = Query(...)):
             bid = store.register(r["url"], title=r["title"], site=r["site"])
         items.append({"id": bid, "title": r["title"],
                       "author": r.get("author") or "", "site": r["site"]})
-    return gw.render_search_page(items, GW_BASE)
+    _log_search(q, len(items), len(errs), time.time() - t0, stats, source="reader")
+    return gw.render_search_page(items, gw_base(request))
 
 
 @app.get("/g/book/{bid}", response_class=HTMLResponse)
-def g_book(bid: str, refresh: int = 0):
+def g_book(request: Request, bid: str, refresh: int = 0):
     b, err = (store.ensure_resolved(bid, fetcher, force=True) if refresh
               else store.get_catalog(bid, fetcher))
     if err:
         return HTMLResponse("<html><body><p>解析失败: %s</p></body></html>" % err,
                             status_code=200)
-    return gw.render_catalog_page(b, GW_BASE)
+    return gw.render_catalog_page(b, gw_base(request))
 
 
 @app.get("/g/chapter/{bid}/{n}", response_class=HTMLResponse)
@@ -427,7 +674,41 @@ def index():
 
 if __name__ == "__main__":
     import uvicorn
-    print("bookhub 启动: %s  (浏览器打开开始找书)" % GW_BASE)
-    print("网关书源文件: %s （导入 Reader 一次，之后 Reader 搜索框直搜所有站）"
-          % os.path.join(BASE_DIR, "bs_gateway.json"))
-    uvicorn.run(app, host=config["host"], port=config["port"], log_level="warning")
+
+    host = config["host"]
+
+    # ① 主端口：被占用则自动顺延，保证网页台一定能起来
+    want_port = int(config["port"])
+    web_port = _pick_port(host, want_port)
+    if web_port != want_port:
+        print("[bookhub] 主端口 %d 已被占用，网页台改用 %d" % (want_port, web_port))
+    config["port"] = web_port
+
+    # ② 网关端口：优先用 gateway_port（默认 80），Reader 对无端口地址兼容性最好
+    want_gw = int(config.get("gateway_port") or 0)
+    gw_port = want_gw if (want_gw and want_gw != web_port
+                          and _port_available(host, want_gw)) else 0
+
+    # ③ 确定网关对外地址，并把 bs_gateway.json 同步成这个地址
+    GW_PRIMARY = _fmt_base(gw_port or web_port)
+    bs_path = _sync_gateway_source(GW_PRIMARY)
+
+    print("bookhub 网页台: %s  (浏览器打开开始找书)" % _fmt_base(web_port))
+    if gw_port:
+        print("Reader 网关:   %s  (端口 %d)" % (GW_PRIMARY, gw_port))
+    else:
+        reason = ("端口 %d 不可用" % want_gw) if want_gw else "未启用独立网关端口"
+        print("Reader 网关:   %s  (%s，网关已并入主端口；"
+              "此前导入过书源的需在 Reader 里重新导入一次)" % (GW_PRIMARY, reason))
+    print("网关书源文件: %s （导入 Reader 一次，之后 Reader 搜索框直搜所有站）" % bs_path)
+
+    # ④ 起监听：网关在子线程（失败不影响网页台），主端口在主线程
+    def _serve_gateway(port):
+        try:
+            uvicorn.run(app, host=host, port=port, log_level="warning")
+        except Exception as e:
+            print("[bookhub] 网关端口 %d 启动失败：%s" % (port, e))
+
+    if gw_port:
+        threading.Thread(target=_serve_gateway, args=(gw_port,), daemon=True).start()
+    uvicorn.run(app, host=host, port=web_port, log_level="warning")

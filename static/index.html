@@ -76,6 +76,8 @@ function setHint() {
   h.innerHTML = HINT; h.style.display = '';
 }
 
+let searchES = null;   // 当前搜索流；重复搜索时先关掉上一条
+
 async function doSearch() {
   const q = $('q').value.trim();
   if (!q) return;
@@ -89,23 +91,65 @@ async function doSearch() {
     loadShelf();
     return;
   }
+
+  if (searchES) { searchES.close(); searchES = null; }
   $('go').disabled = true;
-  $('results').innerHTML = '<div class="empty">搜索中…（各站并发，约几秒）</div>';
-  try {
-    const data = await api('/api/search?q=' + encodeURIComponent(q));
-    if (!data.results.length) {
-      $('results').innerHTML = '<div class="empty">没有找到。试试：<br>1) 换关键词（去掉序号/符号）<br>2) 直接粘贴书籍目录页网址到搜索框</div>';
-    } else {
-      const webN = data.results.filter(x => x.src === 'web').length;
-      const webLine = webN
-        ? `<div class="webln">🌐 网页发现：${webN} 个新站来源（已验证可访问）</div>`
-        : `<div class="webln dim">🌐 网页发现：无结果（搜索引擎暂未收录此书，或已被反爬拦截）</div>`;
-      $('results').innerHTML = webLine + data.results.map(r => card(r)).join('');
+  const box = $('results');
+  box.innerHTML = '<div id="webline"></div><div id="cards"></div>' +
+                  '<div id="spin" class="empty">搜索中…（结果会实时出现）</div>';
+  const cards = $('cards'), spin = $('spin'), wl = $('webline');
+  const seen = new Set();
+  let webN = 0;
+
+  const updateWebLine = () => {
+    wl.innerHTML = webN
+      ? `<div class="webln">🌐 网页发现：${webN} 个新站来源（已验证可访问）</div>`
+      : `<div class="webln dim">🌐 网页发现：搜索中…</div>`;
+  };
+  updateWebLine();
+
+  const es = new EventSource('/api/search/stream?q=' + encodeURIComponent(q));
+  searchES = es;
+
+  es.onmessage = ev => {
+    let d;
+    try { d = JSON.parse(ev.data); } catch (e) { return; }
+
+    if (d.type === 'batch') {
+      // 一批到达就渲染一批，不等其它来源
+      let html = '';
+      d.items.forEach(x => {
+        if (seen.has(x.id)) return;
+        seen.add(x.id);
+        if (x.src === 'web') webN++;
+        html += card(x);
+      });
+      if (html) {
+        cards.insertAdjacentHTML('beforeend', html);
+        updateWebLine();
+        if (spin.parentNode) spin.remove();
+      }
+    } else if (d.type === 'status') {
+      if (!cards.children.length) {
+        spin.textContent = d.msg;
+      }
+    } else if (d.type === 'done') {
+      es.close(); searchES = null; $('go').disabled = false;
+      if (spin.parentNode) spin.remove();
+      if (!cards.children.length) {
+        box.innerHTML = '<div class="empty">没有找到。试试：<br>1) 换关键词（去掉序号/符号）<br>2) 直接粘贴书籍目录页网址到搜索框</div>';
+      }
     }
-  } catch (e) {
-    $('results').innerHTML = '<div class="empty">搜索失败：' + e + '</div>';
-  }
-  $('go').disabled = false;
+  };
+
+  es.onerror = () => {
+    es.close(); searchES = null; $('go').disabled = false;
+    if (spin.parentNode) {
+      spin.textContent = cards.children.length
+        ? '连接中断，已显示部分结果'
+        : '搜索失败，请确认服务在运行';
+    }
+  };
 }
 $('q').addEventListener('keydown', e => { if (e.key === 'Enter') doSearch(); });
 
@@ -227,9 +271,13 @@ function renderHealth(res) {
   $('healthsum').textContent = `体检完成：${res.n_ok}/${res.n_total} 本健康`;
   $('healthreport').innerHTML = res.books.map(b => {
     const lamp = b.ok ? '🟢' : '🔴';
-    const chs = b.chapters.map(c =>
-      `<div class="m" style="margin:2px 0 0 0">第${c.idx}章《${esc(c.title)}》 ${c.len}字 ${c.problems && c.problems.length ? '⚠ ' + esc(c.problems.join('；')) : '✓'}</div>`
-    ).join('');
+    const chs = b.chapters.map(c => {
+      // 0 字不能打勾——那会让「没抓到」看起来像「没问题」
+      const stat = c.len > 0
+        ? `${c.len}字 ${c.problems && c.problems.length ? '⚠ ' + esc(c.problems.join('；')) : '✓'}`
+        : `<span style="color:#999">未取到${c.problems && c.problems.length ? '（' + esc(c.problems.join('；')) + '）' : ''}</span>`;
+      return `<div class="m" style="margin:2px 0 0 0">第${c.idx}章《${esc(c.title)}》 ${stat}</div>`;
+    }).join('');
     const stat = !b.alive ? '站点不可达' : (!b.catalog ? '目录解析失败' : '');
     return `<div class="card" style="padding:10px 14px">
       <div class="t" style="font-size:13.5px">${lamp} ${esc(b.title)} <span class="tag gw">${esc(b.site)}</span>${stat ? `<span class="tag warn">${stat}</span>` : ''}</div>

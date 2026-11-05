@@ -38,7 +38,12 @@ WAF_MARKERS = ("just a moment", "cf-challenge", "cf_chl", "checking your browser
                "访问验证", "安全验证", "正在验证")
 
 NEXT_TEXTS = ("下一页", "下页")
-HOP_TEXTS = ("开始阅读", "查看目录", "目录", "最新章节列表", "全部章节")
+# 「目录跳转」文案：不少站点详情页只放一个「最新章节」小列表，完整目录在另一条
+# 路径上（biquge.tw 是 /book/{id}.html 只给 12 条，/book/{id}/ 才是全本），
+# 靠这些文案识别入口。站点写法五花八门，不要只列少数几种。
+HOP_TEXTS = ("开始阅读", "查看目录", "目录", "最新章节列表", "全部章节",
+             "章节目录", "查看全部章节列表", "查看全部章节", "完整目录",
+             "全部目录", "目录列表", "查看完整目录")
 CONTENT_HINT = re.compile(
     r"(content|booktext|readarea|chaptercontent|htmlcontent|showtxt|"
     r"noveltext|readbox|article|text|txt|read)", re.I)
@@ -184,6 +189,21 @@ class Fetcher:
                 return None
 
 
+def _looks_mojibake(text):
+    """判断文本是否为「UTF-8 字节被按 Latin-1 误解」的产物。
+
+    只做可逆性验证：能 latin-1 回环还原成 UTF-8 且还原后出现汉字，才判为乱码。
+    正常中文调用 encode('latin-1') 会直接抛异常，因此不会误伤正常内容。"""
+    if not text:
+        return False
+    probe = text[:300]
+    try:
+        fixed = probe.encode("latin-1").decode("utf-8")
+    except (UnicodeEncodeError, UnicodeDecodeError):
+        return False
+    return fixed != probe and any("\u4e00" <= ch <= "\u9fff" for ch in fixed)
+
+
 def parse_doc(resp):
     """从响应构造 lxml 文档。
     - 普通响应：按 bytes + meta 声明处理编码
@@ -205,6 +225,20 @@ def parse_doc(resp):
                 doc = lxml.html.fromstring(resp.text)
             except Exception:
                 return None
+        # 编码兜底：bytes 交给 libxml2 时，若 <meta> 的 content/http-equiv 书写
+        # 顺序非标准（Bing 就是 content 在前），libxml2 认不出 charset，退化为
+        # Latin-1，中文全变 mojibake。此时代码层改用 requests 已解码的 text 重解析。
+        try:
+            head = " ".join(doc.xpath("//title/text()"))[:300]
+        except Exception:
+            head = ""
+        if _looks_mojibake(head):
+            try:
+                alt = lxml.html.fromstring(resp.text, base_url=resp.url)
+                if alt is not None:
+                    doc = alt
+            except Exception:
+                pass
     for tb in doc.xpath("//tbody"):
         tb.drop_tag()
     return doc
@@ -250,7 +284,10 @@ def unique_xpath(el, doc):
     if cls and len(cls) <= 60 and '"' not in cls:
         xp = "//%s[@class=\"%s\"]" % (el.tag.lower(), cls)
         try:
-            if len(doc.xpath(xp)) >= 1:
+            # 必须唯一：页面上同 class 的元素往往不止一个（ddkshu 的
+            # btn btn-default 同时用于「目录」和「下一章」，取第一个会抓错链接），
+            # 此时宁可退回绝对路径，也不要给出指错元素的规则。
+            if len(doc.xpath(xp)) == 1:
                 return xp
         except Exception:
             pass
@@ -555,6 +592,32 @@ def find_next_page_anchor(doc, page_url):
             href = a.get("href") or ""
             if href and not href.startswith(("#", "javascript")):
                 return a, urljoin(page_url, href)
+    return None, None
+
+
+# 正文续页的文案：多数站写「下一页」，但有的站（ddkshu 等）把同章的第 2 页
+# 也标成「下一章」——只能靠「URL 不等于真正的下一章」来区分。
+CONTENT_NEXT_TEXTS = NEXT_TEXTS + ("下一章", "下章", "下一节")
+
+
+def find_content_next_anchor(doc, page_url, next_ch_abs=""):
+    """找正文续页链接，返回 (元素, 绝对URL) 或 (None, None)。
+
+    与 find_next_page_anchor 的差别：也接受「下一章」这类文案，但跳过指向
+    真正下一章的链接。ddkshu 那类站每章拆成 (1)页/(2)页，第 1 页的「下一章」
+    实际指向 9_2.html 而不是 10.html，只看文案会漏掉整章的后半部分。
+    """
+    for a in doc.iter("a"):
+        text = norm_space(a.text_content())
+        if text not in CONTENT_NEXT_TEXTS:
+            continue
+        href = a.get("href") or ""
+        if not href or href.startswith(("#", "javascript")):
+            continue
+        absu = norm_url(urljoin(page_url, href))
+        if next_ch_abs and absu == next_ch_abs:
+            continue                    # 这是真正的下一章，不是同章续页
+        return a, urljoin(page_url, href)
     return None, None
 
 
@@ -1516,8 +1579,11 @@ def drop_latest_block(items):
             if any(x is None for x in head) or len(tailn) < 10:
                 continue
             hp = [(a, b) for a, b in zip(head, head[1:])]
-            if (min(head) <= max(tailn)
-                    or sum(1 for a, b in hp if a > b) / len(hp) < 0.9):
+            # 只要求「前缀递减 + 尾部递增」这两条。原来还要求
+            # min(head) > max(tailn)（预览块章号必须全部大于本页正文），
+            # 但第一页正文只到第 20 章、预览块恰好也是第 10~20 章时章号范围重叠，
+            # 该条件不成立便把镜像块当成正文（shyixin 实测：首章变成「第20章」）。
+            if sum(1 for a, b in hp if a > b) / len(hp) < 0.9:
                 continue
             tp = list(zip(tailn, tailn[1:]))
             if sum(1 for a, b in tp if a < b) / len(tp) >= 0.95:
@@ -1533,10 +1599,16 @@ def resolve_book(url, title=None, author=None, name=None, no_search=False,
     report = []
 
     # ---------- 1. 抓取书籍目录页 ----------
+    # 纯数字结尾（/book/12345）：部分站会把它重定向到首页——页面能正常打开，
+    # 但内容不是这本书，于是首页推荐位被当成章节列表，解析出完全不相关的书。
+    # 真实目录在 /book/12345/，先试补斜杠版本，拿不到再回退原地址。
     book_url = url
-    r = f.get(book_url)
+    probe = url + "/" if re.search(r"/\d+$", url) else url
+    r = f.get(probe)
+    if r is None and probe != url:
+        r = f.get(url)
     if r is None:
-        return {"error": "无法打开书籍页面: %s" % book_url}
+        return {"error": "无法打开书籍页面: %s" % url}
     book_url = r.url  # 跟随重定向后的最终 URL
     doc = parse_doc(r)
     if doc is None:
@@ -1564,12 +1636,19 @@ def resolve_book(url, title=None, author=None, name=None, no_search=False,
         return None
 
     def hop_links(page_doc):
-        """页面上指向完整目录页的跳转链接（跳过 javascript: 伪链接）。"""
+        """页面上指向完整目录页的跳转链接（跳过 javascript: 伪链接）。
+
+        除精确文案外，还对短文本做「含目录类词」的包含判断：站点写法差异很大
+        （章节目录 / 查看全部章节列表 / 完整目录…），只靠精确列举必漏。"""
         out = []
         for a in page_doc.iter("a"):
             href = a.get("href") or ""
-            if norm_space(a.text_content()) in HOP_TEXTS \
-                    and href and not href.startswith(("#", "javascript")):
+            if not href or href.startswith(("#", "javascript")):
+                continue
+            txt = norm_space(a.text_content())
+            if not txt or len(txt) > 16:
+                continue
+            if txt in HOP_TEXTS or any(k in txt for k in ("目录", "全部章节", "完整章节")):
                 out.append(a)
         return out
 
@@ -1689,17 +1768,33 @@ def resolve_book(url, title=None, author=None, name=None, no_search=False,
             report.append(("目录分页合并", True, "共 %d 章" % len(chapters)))
             n_ch = len(chapters)
 
-    ch_docs = []
-    for u in (first_abs, mid_abs):
-        rr = f.get(u, referer=list_url)
-        if rr is None:
-            time.sleep(1.5)
-            rr = f.get(u, referer=list_url)  # 站点偶发 404/超时，单次重试
-        if rr is None:
-            return {"error": "无法打开章节页: %s" % u}
-        d = parse_doc(rr)
-        if d is not None:
-            ch_docs.append(d)
+    # 正文抽样：首章必须拿到（下面的正文分页检测以它为基准），中间章只是第二个
+    # 样本，失败不该让整本书作废——站点对连续请求常偶发 403/超时，
+    # 单点失败就 return error 会让一本好好的书直接无法解析。
+    def _sample_chapter(u, tries):
+        for i in range(tries):
+            rr = f.get(u, referer=list_url)
+            if rr is not None:
+                d = parse_doc(rr)
+                if d is not None:
+                    return d
+            if i < tries - 1:
+                time.sleep(1.5 + i)
+        return None
+
+    d_first = _sample_chapter(first_abs, 3)
+    if d_first is None:
+        return {"error": "无法打开章节页: %s" % first_abs}
+    ch_docs = [d_first]
+    d_mid = _sample_chapter(mid_abs, 2)
+    if d_mid is not None:
+        ch_docs.append(d_mid)
+    if len(ch_docs) < 2 and n_ch > 4:
+        # 中间章没拿到：换 1/4 处再试一次。正文容器识别靠多页互相印证，
+        # 只剩单样本时容易判不出（宁可多一次请求，也别让整本书解析失败）。
+        d_alt = _sample_chapter(urljoin(list_url, chapter_hrefs[n_ch // 4]), 2)
+        if d_alt is not None:
+            ch_docs.append(d_alt)
     content_xp = detect_content_xpath(ch_docs)
     if content_xp is None:
         return {"error": "未能识别正文容器"}
@@ -1710,19 +1805,18 @@ def resolve_book(url, title=None, author=None, name=None, no_search=False,
     # ---------- 5. 正文分页 ----------
     enable_ct_next = 0
     ct_next = ("", "")
-    nxt_el, _ = find_next_page_anchor(ch_docs[0], first_abs)
+    next_ch_abs = norm_url(urljoin(list_url, chapter_hrefs[1])) if n_ch > 1 else ""
+    # 用 find_content_next_anchor：它额外接受「下一章」文案，但会排除真正的下一章，
+    # 从而覆盖 ddk 系「每章分 (1)页/(2)页」的站点。
+    nxt_el, _ = find_content_next_anchor(ch_docs[0], first_abs, next_ch_abs)
     if nxt_el is not None:
-        # 该"下一页"必须不像"下一章"（href 不应等于下一章地址）
-        next_href_abs = norm_url(urljoin(first_abs, nxt_el.get("href")))
-        next_ch_abs = norm_url(urljoin(list_url, chapter_hrefs[1])) if n_ch > 1 else ""
-        if next_href_abs != next_ch_abs:
-            ok, extra = verify_content_pagination(f, first_abs, content_xp, nxt_el)
-            if ok:
-                xp = unique_xpath(nxt_el, ch_docs[0])
-                enable_ct_next = 1
-                ct_next = (xp + "/@href", xp)
-                log("OK", "检测到正文分页（续页约 %d 字）" % extra)
-                report.append(("正文分页", True, ""))
+        ok, extra = verify_content_pagination(f, first_abs, content_xp, nxt_el)
+        if ok:
+            xp = unique_xpath(nxt_el, ch_docs[0])
+            enable_ct_next = 1
+            ct_next = (xp + "/@href", xp)
+            log("OK", "检测到正文分页（续页约 %d 字）" % extra)
+            report.append(("正文分页", True, ""))
 
     # ---------- 6. 搜索 ----------
     search_cfg = None

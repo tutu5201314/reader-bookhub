@@ -7,7 +7,9 @@
     "params": "searchkey=%s&searchtype=articlename",
     "charset": "utf-8",
     "name_xpath": "/html/body/div[4]/div[1]/div/div/div/table/div/table/tr/td/div/div[2]/h2/a",
-    "mainpage_xpath": "/html/body/div[4]/div[1]/div/div/div/table/div/table/tr/td/div/div[2]/h2/a/@href"
+    "mainpage_xpath": "/html/body/div[4]/div[1]/div/div/div/table/div/table/tr/td/div/div[2]/h2/a/@href",
+    "disabled": true,
+    "disabled_reason": "域名已失效（pksge.la 无法解析）。POST 站要走完整重试链，单站耗时 45s，占总搜索时长 94%，已停用"
   },
   {
     "name": "大米小说",
@@ -16,6 +18,120 @@
     "url": "https://www.dmxs2.com/search?keyword=%s",
     "charset": "utf-8",
     "name_xpath": "/html/body/div[2]/div[3]/div[2]/div/div/h4/a",
-    "mainpage_xpath": "/html/body/div[2]/div[3]/div[2]/div/div/h4/a/@href"
+    "mainpage_xpath": "/html/body/div[2]/div[3]/div[2]/div/div/h4/a/@href",
+    "disabled": true,
+    "disabled_reason": "站内搜索异常：search?keyword= 会被重定向回首页，返回的是首页内容，产不出任何搜索结果"
+  },
+  {
+    "name": "笔趣阁tw",
+    "host": "https://www.biquge.tw",
+    "method": "GET",
+    "url": "https://www.biquge.tw/search/?searchkey=%s",
+    "charset": "utf-8",
+    "name_xpath": "//a[@class='book-title']",
+    "mainpage_xpath": "//a[@class='book-title']/@href"
+  },
+  {
+    "name": "速读谷",
+    "host": "https://www.sudugu.cc",
+    "method": "GET",
+    "url": "https://www.sudugu.cc/modules/article/search.php?searchkey=%s&searchtype=articlename",
+    "charset": "utf-8",
+    "name_xpath": "//div[@class='itemtxt']/h3/a",
+    "mainpage_xpath": "//div[@class='itemtxt']/h3/a/@href"
+  },
+  {
+    "name": "一心文学",
+    "host": "http://www.shyixin.cn",
+    "method": "GET",
+    "url": "http://www.shyixin.cn/search.php?keyWord=%s",
+    "charset": "utf-8",
+    "name_xpath": "//span[@class='s2']/a",
+    "mainpage_xpath": "//span[@class='s2']/a/@href"
+  },
+  {
+    "name": "天空书屋",
+    "host": "https://m.tkshuw.com",
+    "method": "GET",
+    "url": "https://m.tkshuw.com/search.html?nf=%s",
+    "charset": "utf-8",
+    "name_xpath": "//div[contains(concat(' ',normalize-space(@class),' '),' wrap-box ')]//div[contains(concat(' ',normalize-space(@class),' '),' s_list ')]//a",
+    "mainpage_xpath": "//div[contains(concat(' ',normalize-space(@class),' '),' wrap-box ')]//div[contains(concat(' ',normalize-space(@class),' '),' s_list ')]//a/@href"
+  },
+  {
+    "name": "思兔阅读",
+    "host": "https://www.sto66.com",
+    "method": "GET",
+    "url": "https://www.sto66.com/search/%s.html",
+    "charset": "utf-8",
+    "name_xpath": "//div[contains(concat(' ',normalize-space(@class),' '),' bookbox ')]//h2[contains(concat(' ',normalize-space(@class),' '),' bookname ')]//a",
+    "mainpage_xpath": "//div[contains(concat(' ',normalize-space(@class),' '),' bookbox ')]//h2[contains(concat(' ',normalize-space(@class),' '),' bookname ')]//a/@href"
+  },
+  {
+    "name": "笔趣阁bqquge",
+    "host": "https://www.bqquge.org",
+    "method": "GET",
+    "url": "https://www.bqquge.org/so/%s",
+    "charset": "utf-8",
+    "name_xpath": "//*[contains(concat(' ',normalize-space(@class),' '),' item ')]//h3",
+    "mainpage_xpath": "//*[contains(concat(' ',normalize-space(@class),' '),' item ')]//a/@href"
+  },
+  {
+    "name": "山雨阅读",
+    "host": "https://www.shanyuread.com",
+    "method": "GET",
+    "url": "https://www.shanyuread.com/search.php?searchtype=all&keyword=%s",
+    "charset": "utf-8",
+    "name_xpath": "//a[contains(@href,'/wenxue/')]",
+    "mainpage_xpath": "//a[contains(@href,'/wenxue/')]/@href",
+    "disabled": true,
+    "disabled_reason": "首页可访问，但 search.php 被 Cloudflare 挑战拦截（Just a moment），需 L2 cloudscraper 或 L3 真浏览器"
+  },
+  {
+    "name": "28看书网",
+    "host": "https://www.28ksw.com",
+    "method": "GET",
+    "url": "",
+    "charset": "utf-8",
+    "name_xpath": "",
+    "mainpage_xpath": "",
+    "disabled": true,
+    "disabled_reason": "无站内搜索：站内『搜索』指向外部 sososhu.com，站点自述为搜索引擎转码站，不具备 query_url，不能作为种子站"
+  },
+  {
+    "name": "🐣爱丽丝书屋(极速版）,排版优化",
+    "host": "https://www.alicesw.com",
+    "method": "GET",
+    "url": "https://www.alicesw.com/search.html?q=%s&p=1",
+    "charset": "utf-8",
+    "name_xpath": "//*[contains(concat(' ',normalize-space(@class),' '),' list-group-item ')]//h5",
+    "mainpage_xpath": "//*[contains(concat(' ',normalize-space(@class),' '),' list-group-item ')]//a/@href"
+  },
+  {
+    "name": "52书库",
+    "host": "https://www.52shuku.net",
+    "method": "GET",
+    "url": "https://www.52shuku.net/so/search.php?q=%s",
+    "charset": "utf-8",
+    "name_xpath": "//*[contains(concat(' ',normalize-space(@class),' '),' excerpt ')]//h2//a",
+    "mainpage_xpath": "//*[contains(concat(' ',normalize-space(@class),' '),' excerpt ')]//h2//a/@href"
+  },
+  {
+    "name": "禁忌书屋",
+    "host": "https://www.cool18.com/bbs4",
+    "method": "GET",
+    "url": "https://www.cool18.com/bbs4/index.php?action=search&act=threadsearch&app=forum&keywords=%s&submit=%E6%9F%A5%E8%AF%A2&p=1",
+    "charset": "utf-8",
+    "name_xpath": "//*[contains(concat(' ',normalize-space(@class),' '),' thread-list ')]//li//a",
+    "mainpage_xpath": "//*[contains(concat(' ',normalize-space(@class),' '),' thread-list ')]//li//a/@href"
+  },
+  {
+    "name": "新笔趣阁",
+    "host": "https://www.xbqg777.com",
+    "method": "GET",
+    "url": "https://www.xbqg777.com/search?keyword=%s",
+    "charset": "utf-8",
+    "name_xpath": "//*[contains(concat(' ',normalize-space(@class),' '),' card ')]//*[contains(concat(' ',normalize-space(@class),' '),' title ')]",
+    "mainpage_xpath": "//*[contains(concat(' ',normalize-space(@class),' '),' card ')]//a/@href"
   }
 ]

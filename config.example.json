@@ -1,6 +1,7 @@
 {
   "host": "127.0.0.1",
-  "port": 80,
+  "port": 8787,
+  "gateway_port": 80,
   "reader_dir": "D:\\bookhub-books",
   "headless": true
 }
