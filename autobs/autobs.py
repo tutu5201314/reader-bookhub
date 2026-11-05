@@ -64,6 +64,11 @@ CHAPTERISH_HEAD = re.compile(
     r"^(第\s*[\d一二三四五六七八九十百千零〇两]+[章节回卷部]|番外|楔子|序章|序幕|尾声|"
     r"Chapter\s*\d+|\d{1,4}[、.．]\s*\S)")
 
+# 目录分页最多翻多少页。20 页封顶只够 400 章（每页 20 章的书），
+# 遇到 1800+ 章的长篇会把目录腰斩且不报错——这里放宽到 300 页，另配时间上限兜底。
+MAX_CATALOG_PAGES = 300
+CATALOG_MERGE_BUDGET = 300  # 秒；超过就停，宁缺勿卡死
+
 COMMON_SEARCH = [
     ("GET", "/search.php?searchkey=%s", None),
     ("GET", "/s.php?q=%s", None),
@@ -328,9 +333,36 @@ def rel_tag_path(container, el):
 
 
 def _chap_num(t):
-    """标题里的章节号（第X章 / X. 两种形态），取不到返回 None。"""
-    m = re.match(r"^\s*(?:第\s*(\d+)\s*章|(\d+)\s*[.、])", t or "")
+    """标题里的章节号（第X章 / 第X（2）章 / X. 三种形态），取不到返回 None。"""
+    m = re.match(r"^\s*(?:第\s*(\d+)\s*(?:[（(]\s*\d+\s*[）)])?\s*[章节回卷部]|(\d+)\s*[.、])", t or "")
     return int(m.group(1) or m.group(2)) if m else None
+
+
+def sort_chapters_by_num(chapters):
+    """章号基本有序、只有少量错位时按章号重排；返回 (新列表, 是否改动)。
+
+    各站目录分页的排序方向常常不一致（首页"最新在前"，后续页正序），合并后会
+    出现 1..1839 之后才接 1840..1849 的乱序。但分卷书会**重新编号**（第1..210
+    章之后又回到第24章），那种书按号排序等于把正文彻底打乱——所以先要求"最长
+    递增段 ≥90%"，不满足就原样返回。章号取不全（含卷名/番外）时同样不动。
+    """
+    n = len(chapters)
+    if n <= 20:
+        return chapters, False
+    seq = [_chap_num(c.get("title")) for c in chapters]
+    if any(x is None for x in seq):
+        return chapters, False
+    best = cur = 1
+    for i in range(1, n):
+        cur = cur + 1 if seq[i] >= seq[i - 1] else 1
+        if cur > best:
+            best = cur
+    if best < n * 0.9:
+        return chapters, False
+    order = sorted(range(n), key=lambda i: (seq[i], i))
+    if order == list(range(n)):
+        return chapters, False
+    return [chapters[i] for i in order], True
 
 
 def group_anchors(doc, min_count=5):
@@ -1744,8 +1776,11 @@ def resolve_book(url, title=None, author=None, name=None, no_search=False,
     chapters = [{"title": norm_space(e.text_content()),
                  "url": urljoin(list_url, h)}
                 for e, h in zip(chapters_el, chapter_hrefs)]
+    _dropped_ch = chapters[:0]
+    _pre_drop = list(chapters)
     chapters, dropped = drop_latest_block(chapters)
     if dropped:
+        _dropped_ch = _pre_drop[:dropped]
         chapters_el = chapters_el[dropped:]
         chapter_hrefs = chapter_hrefs[dropped:]
     n_ch = len(chapters)
@@ -1772,7 +1807,12 @@ def resolve_book(url, title=None, author=None, name=None, no_search=False,
     if ch_next:
         cur_doc, cur_url, pseen = doc, list_url, {norm_url(list_url)}
         seen = {norm_url(c["url"]) for c in chapters}
-        for _ in range(20):
+        _t_merge = time.time()
+        for _page_i in range(MAX_CATALOG_PAGES):
+            if time.time() - _t_merge > CATALOG_MERGE_BUDGET:
+                log("WARN", "目录分页合并超时（%ds），已合并 %d 章" % (
+                    CATALOG_MERGE_BUDGET, len(chapters)))
+                break
             # 不用 ch_next[0] 的位置 xpath：目录分页后各页按钮数量不同
             # （p2 多"上一页"），同位置会取到页码/回退链接；语义查找更稳
             _el, nu = find_next_page_anchor(cur_doc, cur_url)
@@ -1803,11 +1843,33 @@ def resolve_book(url, title=None, author=None, name=None, no_search=False,
                     added += 1
             if not added:
                 break
+            if (_page_i + 1) % 25 == 0:
+                log("INFO", "目录分页合并中… 已 %d 章（第 %d 页）" % (len(chapters), _page_i + 2))
             cur_doc, cur_url = dp, nu
+        # 被当成"最新章节镜像块"删掉的那几条，如果是全书目录里根本没有的新章，
+        # 补回尾部（真镜像块的 URL 一定已在 seen 里，会被这里跳过）。
+        if _dropped_ch:
+            _nums = [_chap_num(c["title"]) for c in _dropped_ch]
+            if all(x is not None for x in _nums) and _nums == sorted(_nums, reverse=True):
+                _dropped_ch = list(reversed(_dropped_ch))
+            _back = 0
+            for c in _dropped_ch:
+                k2 = norm_url(c["url"])
+                if k2 not in seen:
+                    seen.add(k2)
+                    chapters.append(c)
+                    _back += 1
+            if _back:
+                log("INFO", "补回顶部最新章 %d 条（非镜像，目录里原本缺）" % _back)
         if len(chapters) != n_ch:
             log("OK", "目录分页合并: %d → %d 章" % (n_ch, len(chapters)))
             report.append(("目录分页合并", True, "共 %d 章" % len(chapters)))
             n_ch = len(chapters)
+        # 各页排序方向可能不一致（首页按"最新在前"，后续页按正序），合并后
+        # 会得到 1..1839 后面跟着 1840..1849 之外的乱序。章号齐全时按号重排。
+        chapters, _sorted = sort_chapters_by_num(chapters)
+        if _sorted:
+            log("INFO", "目录顺序已按章号重排（%d 章）" % len(chapters))
 
     # 正文抽样：首章必须拿到（下面的正文分页检测以它为基准），中间章只是第二个
     # 样本，失败不该让整本书作废——站点对连续请求常偶发 403/超时，

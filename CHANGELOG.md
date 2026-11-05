@@ -513,3 +513,28 @@ python scripts/import_book_sources.py --keyword 诡秘之主 --min-results 5
 ## 验证汇总
 
 `python -m pytest tests/ -q` → **92 passed, 3 skipped**。启动横幅实测输出 `L3 真浏览器:   可用（C:\Program Files\Google\Chrome\Application\chrome.exe）`。
+
+---
+
+# 2026-11-05 补丁：目录分页上限与排序（FIX-21）
+
+## 问题
+
+给《从鹰人进化为天使后，我荡平诸神》换源到一心文学（1864 章）时发现两处目录解析缺陷：
+
+1. **目录分页只翻 20 页**：合并循环写死 `for _ in range(20)`，每页 20 章的书最多 400 章。该站目录 94 页，实际只合并到 430 章就停了，日志报「20 → 430 章」看不出被截断。
+2. **分页方向不一致导致乱序**：该站第 1 页「最新在前」（第1849→第1830章），第 2 页起正序（第1章起），合并后最新 10 章跑到了目录最前面。
+
+## 改动
+
+- `autobs/autobs.py`：新增 `MAX_CATALOG_PAGES = 300` 与 `CATALOG_MERGE_BUDGET = 300`（秒时间预算），合并循环带进度日志（每 25 页一行），超时 WARN 退出而不是卡死。
+- `autobs/autobs.py`：新增 `sort_chapters_by_num()`，章号齐全且最长递增段 ≥90% 时按章号重排；分卷重编号的书（如《大日金乌纵横诸天》，最长递增段 44%）自动跳过。
+- `autobs/autobs.py`：`_chap_num` 支持 `第X（N）章` 分节写法（原来遇到就返回 None，导致整本书放弃排序）。
+- `autobs/autobs.py`：被 `drop_latest_block` 误判为镜像的头部块，URL 未出现在全书目录里时补回尾部。
+- 新增 `tests/test_catalog_paging.py`(6)。
+
+## 验证
+
+`python -m pytest tests/ -q` → **98 passed, 3 skipped**。
+
+真网复跑《鹰人》：目录 1864 章（修前 430 章），首「第1 章 高蛮山鹰人部落」末「第 1849章落去旧时代的残余」，正文抽查 2494 / 1722 / 2260 / 2156 / 1064 字；体检两本书全绿（一心文学 `alive=True / 正常`）。
