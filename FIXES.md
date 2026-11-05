@@ -25,6 +25,8 @@
 | FIX-16 | §13 | SSE 超时与站点超时耦合 | 已修 |
 | FIX-17 | 新增 | 体检只会说「站点不可达」，分不清 CF 拦截/超时/404 | 已修 |
 | FIX-18 | 新增 | `_refreshing` 被写进磁盘 → 重启后后台刷新永久停摆 | 已修 |
+| FIX-19 | 新增 | L3 依赖缺失：包在 requirements 里但没装，L3 静默全废 | 已修 |
+| FIX-20 | 新增 | 天空书屋内容投毒却仍是启用种子站 | 已修 |
 
 ---
 
@@ -459,3 +461,40 @@ raw = self.s.get(url, timeout=timeout)      # 裸 L1，先拿状态码
 
 **验证**
 `tests/test_gateway_cache.py` 追加 2 条：`_persist` 后磁盘上没有 `_refreshing` 但 `title` 等持久字段还在；磁盘上带 `_refreshing: true` 的旧文件加载后该字段被丢弃。
+
+---
+
+## FIX-19 L3 依赖缺失：包在 requirements 里但没装，L3 静默全废
+
+**文件** `requirements.txt`（`DrissionPage>=4.0`）、`engine/fetcher.py:44-131`（`BrowserLayer`）
+
+**问题**
+`requirements.txt` 声明了 `DrissionPage>=4.0`，但本机实际 `import DrissionPage` → `ModuleNotFoundError`。`BrowserLayer._ensure()` 抛的异常被 `get()` 外层 `except` 吞成 `[L3] browser failed: No module named 'DrissionPage'` 后返回 `None`，**L3 整层等于不存在**，而所有上层逻辑（`_req_layers` 的第三层、`diagnose` 的「Cloudflare 人机挑战（L3 可试）」判定）都以为它还在。换源排查时才暴露：任何 JS 渲染站、CF 挑战站都只能判「不可达」。
+
+**改法**
+- 环境层：`python -m pip install "DrissionPage>=4.0"`（装到 4.1.1.4），依赖本机 Chrome/Edge（本机两者都有）。
+- 文档层：README 环境要求里把「可选：Chrome 或 Edge」改成明确的两件套（Python 包 + 本机浏览器），并给出 3 行自检命令，避免下次再靠翻日志才发现。
+
+**验证**
+```
+biquge.tw      L3 -> 44385 bytes  5.4s
+shanyuread.com L3 -> 44616 bytes  4.6s
+ddkshu.com     L3 ->  4936 bytes  1.5s   ← CF 硬拦截页，IP 级封禁，L3 也过不去（符合预期）
+```
+`biquge.tw` 之前 L1 恒 403、只能靠 L2 兜底，现在 L3 直接 44KB 正常页 → L3 通路恢复。
+注：`shanyuread.com` 标题仍是「请稍候…」，说明 CF 挑战在 `BrowserLayer.get()` 的 10s 等待窗内没解完，属已知限制（该站种子仍停用）。
+
+---
+
+## FIX-20 天空书屋内容投毒却仍是启用种子站
+
+**文件** `engine/seeds.json:53-61`
+
+**问题**
+换源《从鹰人进化为天使后，我荡平诸神》时实测：`m.tkshuw.com`（及 www 域）目录章数与原站一致（1863），但**第 5/6/900 章随机返回别的书的正文**（「第59章 你知道皓月的真正身份吗」「宋家被抄了」「冒险者工会…」），且污染会直接落进 `data/cache/{id}/`。它又是所有种子里章数最多的一个，搜索排序靠前，用户点进去就是串书。
+
+**改法**
+`engine/seeds.json` 该条目加 `"disabled": true` + `disabled_reason`，与既有 4 个停用站的记录格式一致。启用种子站 10 → 9。
+
+**验证**
+`load_seeds()` 返回 9 站，天空书屋不再出现；搜索《鹰人》时结果里只剩笔趣阁tw 与书迷楼两个真实源。条目保留未删，日后若站点修好，去掉 `disabled` 即可复活。

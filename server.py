@@ -809,6 +809,14 @@ if __name__ == "__main__":
               "此前导入过书源的需在 Reader 里重新导入一次)" % (GW_PRIMARY, reason))
     print("网关书源文件: %s （导入 Reader 一次，之后 Reader 搜索框直搜所有站）" % bs_path)
 
+    # ③b L3 依赖自检：缺 DrissionPage / 浏览器时 L3 会静默失效，必须在启动时说出来
+    try:
+        from engine.fetcher import l3_available
+        _l3ok, _l3why = l3_available()
+        print("L3 真浏览器:   %s" % ("可用（%s）" % _l3why if _l3ok else "不可用 —— %s" % _l3why))
+    except Exception as _e:
+        print("L3 真浏览器:   自检失败 %r" % (_e,))
+
     # ④ 章节缓存配额：超了就按最久未读整本清掉，避免无限长胖
     try:
         _limit = int(config.get("cache_max_mb") or 500) * 1024 * 1024

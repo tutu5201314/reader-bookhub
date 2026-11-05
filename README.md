@@ -39,7 +39,10 @@ Reader 的搜索框从此搜到的是 bookhub 聚合的全部来源。
 - 本机 8787 端口（网页台，被占用会自动顺延）
 - 80 端口空闲更省事：网关优先抢 80，Reader 对无端口地址兼容性最好。
   80 被占用时网关自动并入主端口，在线搜书需重新导入书源，txt 导出不受影响
-- 可选：Chrome 或 Edge（少数强防护站点需要真浏览器兜底）
+- L3 真浏览器兜底：需要 `DrissionPage`（已在 requirements.txt 里）**和**本机装有 Chrome 或 Edge。
+  只装了 Python 包、没装浏览器时 L3 会静默失效，日志里表现为 `[L3] browser failed: ...`。
+  自检：`python -c "from engine.fetcher import BrowserLayer; b=BrowserLayer(); print(b.get('https://www.biquge.tw/') is not None); b.close()"`，
+  打印 `True` 才算 L3 可用
 
 ## 安装
 

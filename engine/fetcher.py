@@ -36,6 +36,36 @@ class BrowserResponse:
         self.browser = True
 
 
+_BROWSER_CANDIDATES = (
+    r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+    r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+    r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+    r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
+)
+
+
+def l3_available():
+    """L3 真浏览器能不能用：DrissionPage 装了 + 本机有 Chrome/Edge。
+
+    只查依赖，不启动浏览器（启动要 2~5s，不适合开机就做）。
+    返回 (ok, 说明)。缺依赖时 L3 会静默返回 None，所以要在启动日志里说清楚。
+    """
+    try:
+        import DrissionPage  # noqa: F401
+    except Exception:
+        return False, "缺少 DrissionPage（pip install -r requirements.txt）"
+    import shutil
+    import os
+    for path in _BROWSER_CANDIDATES:
+        if os.path.exists(path):
+            return True, path
+    for exe in ("chrome", "msedge"):
+        found = shutil.which(exe)
+        if found:
+            return True, found
+    return False, "未找到 Chrome/Edge"
+
+
 class BrowserLayer:
     """L3：真浏览器（Chrome 优先，Edge 兜底），懒启动、进程内单例。
 
@@ -72,7 +102,7 @@ class BrowserLayer:
                 browser = name
                 break
         if browser is None:
-            raise RuntimeError("未找到 Chrome/Edge 浏览器")
+            raise RuntimeError("未找到 Chrome/Edge 浏览器（L3 需要本机装 Chrome 或 Edge）")
         if self.headless:
             opts.headless()
         opts.set_argument("--disable-blink-features=AutomationControlled")

@@ -485,3 +485,31 @@ python scripts/import_book_sources.py --keyword 诡秘之主 --min-results 5
 | 从鹰人进化为天使后，我荡平诸神 | False | Cloudflare 硬拦截（403，本机 IP 被挡） | 🟡 warn | 1859 | 首章 2492 字；中/末章「站点不可达，未抽查」 |
 
 > 注：`ddkshu.com` 需要换出口 IP 或换源，不是解析问题。缓存里已有的章节照常可读。
+
+---
+
+# 2026-11-05 补丁：L3 依赖自检 + 投毒站停用
+
+## 一、L3 依赖缺失却无人知晓（FIX-19）
+
+**问题**：`requirements.txt` 声明了 `DrissionPage>=4.0`，但本机 `import DrissionPage` → `ModuleNotFoundError`。`BrowserLayer._ensure()` 抛的异常被 `get()` 外层吞成 `[L3] browser failed: ...` 后返回 `None`，**L3 整层等于不存在**，而 `_req_layers` 的第三层和 `diagnose` 的「CF 人机挑战（L3 可试）」都以为它还在。换源排查时才暴露：JS 渲染站、CF 挑战站一律只能判「不可达」。
+
+**改动**
+- 环境：`pip install "DrissionPage>=4.0"`（4.1.1.4），配合本机 Chrome/Edge。
+- `engine/fetcher.py:39-68` 新增 `l3_available()`：只查依赖不启动浏览器，返回 `(ok, 说明)`。
+- `server.py:812-819` 启动横幅增一行 `L3 真浏览器: 可用（<浏览器路径>）` / `不可用 —— 缺少 DrissionPage`，不再需要翻日志才发现。
+- README 环境要求：「可选：Chrome 或 Edge」改为「DrissionPage + 本机浏览器」两件套，并给出 3 行自检命令。
+
+**验证**：`tests/test_l3_probe.py`(3) 覆盖缺包 / 缺浏览器 / 齐全；真机 L3 实测 `biquge.tw` 44KB（此前 L1 恒 403 只能靠 L2）、`ddkshu` 4936 字节 CF 硬拦截页（IP 级封禁，L3 也过不去，符合预期）。
+
+## 二、天空书屋内容投毒却仍是启用种子站（FIX-20）
+
+**问题**：换源实测 `m.tkshuw.com` 目录章数与原站一致（1863），但第 5/6/900 章随机返回**别的书的正文**，且污染会落进 `data/cache/{id}/`。它又是所有种子里章数最多的，搜索排序靠前，点进去就是串书。
+
+**改动**：`engine/seeds.json:53-61` 加 `"disabled": true` + `disabled_reason`（与既有 4 个停用站格式一致），启用站 10 → 9。条目保留，站点修好后去掉 `disabled` 即可复活。
+
+**验证**：`load_seeds()` 返回 9 站；搜《鹰人》只剩笔趣阁tw 与书迷楼两个真实源。
+
+## 验证汇总
+
+`python -m pytest tests/ -q` → **92 passed, 3 skipped**。启动横幅实测输出 `L3 真浏览器:   可用（C:\Program Files\Google\Chrome\Application\chrome.exe）`。

@@ -52,6 +52,8 @@
   {
     "name": "天空书屋",
     "host": "https://m.tkshuw.com",
+    "disabled": true,
+    "disabled_reason": "内容投毒：目录章数与原站一致（1863），但第 5/6/900 章起随机返回别的书的正文（m 域与 www 域表现相同），章节缓存会被污染，已停用",
     "method": "GET",
     "url": "https://m.tkshuw.com/search.html?nf=%s",
     "charset": "utf-8",
