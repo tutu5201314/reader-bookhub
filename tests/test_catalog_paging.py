@@ -62,6 +62,27 @@ def test_sort_chapters_by_num_ignores_tiny_lists():
     assert changed is False and out is tiny
 
 
+def test_sort_survives_duplicate_numbers_and_misplaced_block():
+    # 真实案例：一心文学 1864 章，第 121 位插进了「最新在前」的 1849..1840 块，
+    # 且站点目录本身有重复章号（第268章出现两次）、个别缺号。
+    # 用"最长递增段"判定时这类目录只有 39%，永远判不过去；改用 +1 占比后
+    # 98.6% → 正常重排。
+    chs = [_ch("第%d章 x" % i) for i in range(1, 121)]
+    chs += [_ch("第%d章 x" % i) for i in range(1849, 1839, -1)]
+    for i in range(121, 1840):
+        chs.append(_ch("第%d章 x" % i))
+        if i == 268:
+            chs.append(_ch("第%d章 x" % i))  # 重复号
+    out, changed = autobs.sort_chapters_by_num(chs)
+    assert changed is True
+    nums = [autobs._chap_num(c["title"]) for c in out]
+    assert nums[:3] == [1, 2, 3]
+    assert nums[-1] == 1849
+    # 重复号保留，不丢章
+    assert len(out) == len(chs)
+    assert nums.count(268) == 2
+
+
 def test_sort_chapters_by_num_leaves_renumbered_volumes_alone():
     # 分卷重编号：1..210 之后又从 24 开始，按号排序会毁掉正文顺序
     chs = [_ch("第%d章 x" % i) for i in range(1, 211)]

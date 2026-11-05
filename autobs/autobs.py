@@ -15,6 +15,7 @@ autobs - Reader(binbyu/Reader) 书源自动配置工具
 依赖: requests, lxml
 """
 import argparse
+import bisect
 import json
 import os
 import re
@@ -343,8 +344,16 @@ def sort_chapters_by_num(chapters):
 
     各站目录分页的排序方向常常不一致（首页"最新在前"，后续页正序），合并后会
     出现 1..1839 之后才接 1840..1849 的乱序。但分卷书会**重新编号**（第1..210
-    章之后又回到第24章），那种书按号排序等于把正文彻底打乱——所以先要求"最长
-    递增段 ≥90%"，不满足就原样返回。章号取不全（含卷名/番外）时同样不动。
+    章之后又回到第24章），那种书按号排序等于把正文彻底打乱——所以先判断"这本来
+    就是一本几乎有序的目录，只是少量条目错位"：**最长递增子序列 ≥90%** 才重排。
+    章号取不全（含卷名/番外）时同样不动。
+
+    为什么用 LIS 而不是"最长递增段"或"+1 占比"：
+      - 最长递增段会被站点目录里的重复号/缺号切碎（实测一本书 98.6% 的相邻对都是
+        +1，最长段却只有 39%），阈值再合理也判不过去；
+      - "+1 占比"反过来识别不出分卷重编号——每卷内部都是 +1，占比照样 99%。
+    LIS 衡量的是"删掉多少条才能变有序"：错位 10 条的 1864 章目录 LIS 98.7%，
+    分卷重编号的书 LIS 只有 45% 左右。
     """
     n = len(chapters)
     if n <= 20:
@@ -352,12 +361,14 @@ def sort_chapters_by_num(chapters):
     seq = [_chap_num(c.get("title")) for c in chapters]
     if any(x is None for x in seq):
         return chapters, False
-    best = cur = 1
-    for i in range(1, n):
-        cur = cur + 1 if seq[i] >= seq[i - 1] else 1
-        if cur > best:
-            best = cur
-    if best < n * 0.9:
+    tails = []
+    for x in seq:
+        i = bisect.bisect_left(tails, x)
+        if i == len(tails):
+            tails.append(x)
+        else:
+            tails[i] = x
+    if len(tails) < n * 0.9:
         return chapters, False
     order = sorted(range(n), key=lambda i: (seq[i], i))
     if order == list(range(n)):
