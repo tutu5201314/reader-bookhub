@@ -280,17 +280,27 @@ async function healthcheck() {
 
 function renderHealth(res) {
   if (!res) return;
-  $('healthsum').textContent = `体检完成：${res.n_ok}/${res.n_total} 本健康`;
+  const nOk = res.books.filter(b => (b.level || (b.ok ? 'ok' : 'bad')) === 'ok').length;
+  const nWarn = res.books.filter(b => b.level === 'warn').length;
+  $('healthsum').textContent = `体检完成：${nOk}/${res.n_total} 本健康` +
+    (nWarn ? `，${nWarn} 本站点暂不可达（缓存仍可读）` : '');
   $('healthreport').innerHTML = res.books.map(b => {
-    const lamp = b.ok ? '🟢' : '🔴';
+    const lamp = b.level === 'bad' ? '🔴' : (b.level === 'warn' ? '🟡' : '🟢');
     const chs = b.chapters.map(c => {
       // 0 字不能打勾——那会让「没抓到」看起来像「没问题」
-      const stat = c.len > 0
-        ? `${c.len}字 ${c.problems && c.problems.length ? '⚠ ' + esc(c.problems.join('；')) : '✓'}`
-        : `<span style="color:#999">未取到${c.problems && c.problems.length ? '（' + esc(c.problems.join('；')) + '）' : ''}</span>`;
+      let stat;
+      if (c.skipped) {
+        stat = `<span style="color:#999">${esc(c.skipped)}</span>`;
+      } else if (c.len > 0) {
+        stat = `${c.len}字 ${c.problems && c.problems.length ? '⚠ ' + esc(c.problems.join('；')) : '✓'}`;
+      } else {
+        stat = `<span style="color:#999">未取到${c.problems && c.problems.length ? '（' + esc(c.problems.join('；')) + '）' : ''}</span>`;
+      }
       return `<div class="m" style="margin:2px 0 0 0">第${c.idx}章《${esc(c.title)}》 ${stat}</div>`;
     }).join('');
-    const stat = !b.alive ? '站点不可达' : (!b.catalog ? '目录解析失败' : '');
+    const stat = !b.alive
+      ? (b.alive_reason ? '站点不可达：' + b.alive_reason : '站点不可达')
+      : (!b.catalog ? '目录解析失败' : '');
     return `<div class="card" style="padding:10px 14px">
       <div class="t" style="font-size:13.5px">${lamp} ${esc(b.title)} <span class="tag gw">${esc(b.site)}</span>${stat ? `<span class="tag warn">${stat}</span>` : ''}</div>
       <div class="m">目录 ${b.catalog} 章</div>${chs}</div>`;

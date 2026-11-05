@@ -448,3 +448,40 @@ python scripts/import_book_sources.py --keyword 诡秘之主 --min-results 5
 
 `python -m pytest tests/ -q` → **81 passed, 3 skipped**。新增测试：
 `tests/test_gateway_cache.py`(4)、`tests/test_fetcher_throttle.py`(3)、`tests/test_browser_pool.py`(3)、`tests/test_cache_quota.py`(3)、`tests/test_server_jobs.py`(4)，`tests/test_units.py` 追加 4 条水印用例。
+
+---
+
+## 2026-11-05 补丁：体检诊断与 `_refreshing` 残留
+
+> 触发：用户实测体检，《从鹰人进化为天使后，我荡平诸神》显示「站点不可达」，但同时亮绿灯。
+
+### 一、体检只会说「站点不可达」（FIX-17）
+
+**问题**：探活只有一个布尔（`fetcher.get(url, quick=True)` 返回 None 即不可达）。四种完全不同的病在界面上长得一模一样：Cloudflare 硬拦截、Cloudflare 人机挑战、连接超时、HTTP 404。
+
+**实测**：`https://www.ddkshu.com/dk-416895.html` 裸请求 403 / 4545 字节，响应头 `server: cloudflare`、`cf-ray: ...-LAX`，正文 `<title>Attention Required! | Cloudflare</title>` —— 是**本机出口 IP 被 CF 挡**，站点本身没挂。对照组 `biquge.tw` 同样 L1 恒 403，但 L2 稳定 200。只看布尔值，这两本书会被判成同一种病。
+
+**改动**
+- `engine/fetcher.py:274-325` 新增 `diagnose(url)`，返回 `{"ok", "code", "reason"}`：裸 L1 先拿状态码；`requests.Timeout` 直接判「连接超时」不走 L2（省 20s）；其余给 L2 一次机会，过了报「L1 被挡，L2 兜底通过」；仍不过按特征页分类为 CF 硬拦截 / CF 人机挑战 / 403 / 404 / 防护页。
+- `server.py:589-660`：`entry["alive_reason"]` 存原因；`alive=False` 时中/末章不再实抓（没缓存标 `skipped: "站点不可达，未抽查"`），避免把站点故障误报成章节故障，也省掉 3 次超时。
+- 三态灯 `entry["level"]`：`ok` 绿 / `warn` 黄（站点当前不可达，但目录与缓存还在，已缓存章仍可读）/ `bad` 红（目录或首章坏了）。
+- `static/index.html`：🟡 黄灯 + 「站点不可达：Cloudflare 硬拦截（403，本机 IP 被挡）」；汇总改为「N/M 本健康，K 本站点暂不可达（缓存仍可读）」。
+
+### 二、`_refreshing` 被写进磁盘（FIX-18）
+
+**问题**：`get_catalog` 触发后台刷新前会置 `b["_refreshing"] = True`，`finally` 里复位。刷新途中进程被杀（关 Reader、Ctrl+C）时 `_persist` 已把这个字段写进 `data/books/{id}.json`，重启后被当成真的读回来 —— 于是这本书的目录**再也不会自动追更**，界面上看不出任何异常。实测 `6e31a7d02c.json` 里就残留着 `"_refreshing": true`。
+
+**改动**：`_persist` 落盘前过滤下划线开头的运行时键；加载时 `b.pop("_refreshing", None)`，已经写脏的旧文件也能自愈。
+
+### 验证
+
+`python -m pytest tests/ -q` → **89 passed, 3 skipped**。新增 `tests/test_health_diagnose.py`(6)，`tests/test_gateway_cache.py` 追加 2 条。
+
+真网复跑体检（2 本）：
+
+| 书 | alive | 原因 | 灯 | 目录 | 抽查 |
+|---|---|---|---|---|---|
+| 大日金乌纵横诸天 | True | L1 被挡，L2 兜底通过 | 🟢 ok | 473 | 1678 / 1334 / 1825 字 |
+| 从鹰人进化为天使后，我荡平诸神 | False | Cloudflare 硬拦截（403，本机 IP 被挡） | 🟡 warn | 1859 | 首章 2492 字；中/末章「站点不可达，未抽查」 |
+
+> 注：`ddkshu.com` 需要换出口 IP 或换源，不是解析问题。缓存里已有的章节照常可读。

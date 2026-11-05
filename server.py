@@ -595,10 +595,11 @@ def api_healthcheck():
             """单本体检：1 次探活 + 首/中/末章各一次快抓（有缓存则读缓存）。"""
             entry = {"id": b["id"], "title": (b.get("title") or "")[:30],
                      "site": b.get("site") or "", "alive": False,
-                     "catalog": 0, "chapters": [], "ok": False}
-            # 站点探活（快速模式：单次 8s）
-            r = fetcher.get(b.get("list_url") or b.get("url"), quick=True)
-            entry["alive"] = r is not None and len(r.content) > 1000
+                     "alive_reason": "", "catalog": 0, "chapters": [], "ok": False}
+            # 站点探活：顺手问清「为什么不通」（CF 硬拦截 / 超时 / 404 分得开）
+            probe = fetcher.diagnose(b.get("list_url") or b.get("url"))
+            entry["alive"] = bool(probe.get("ok"))
+            entry["alive_reason"] = probe.get("reason") or ""
             # 目录（用已有解析结果，不强制重解析）
             b2, err = store.get_catalog(b["id"], fetcher)
             entry["catalog"] = len(b2.get("chapters") or []) if b2 else 0
@@ -616,11 +617,18 @@ def api_healthcheck():
                         except Exception:
                             text = None
                     checked = True
-                    # 三章都实抓：没缓存就抓一次（实测 0.2~0.7s/章，整本多花不到 1s）。
-                    # 原来只抓首章，中/末章没缓存时显示「0字 ✓」，容易被误读成抓取失败。
-                    if text is None:
+                    # 站点探活已经失败时不再实抓：既省掉 3 次超时，也避免把
+                    # 「站点挂了」误报成「章节抓不到」。没缓存就标成跳过。
+                    if text is None and entry["alive"]:
                         text = _quick_chapter(b2, ch, fetcher)
                     if text is None:
+                        if not entry["alive"]:
+                            # 站点不可达：中/末章没缓存属正常，不参与判定
+                            entry["chapters"].append(
+                                {"idx": idx + 1, "title": ch["title"][:20],
+                                 "len": 0, "problems": [],
+                                 "skipped": "站点不可达，未抽查"})
+                            continue
                         # 首章抓不到说明这本书可能不可用；中/末章失败多为站点瞬时波动，
                         # 不参与整体判定，避免一次网络抖动就把整本判红
                         checked = idx == 0
@@ -636,6 +644,16 @@ def api_healthcheck():
             # 已缓存章节仍可读）
             entry["ok"] = bool(entry["catalog"]) and all(
                 not c["problems"] for c in entry["chapters"])
+            # 三态灯：绿=能用；黄=站点当前不可达但目录/缓存还在（还能读已缓存的章）；
+            # 红=目录或首章坏了（真读不了）
+            if not entry["catalog"]:
+                entry["level"] = "bad"
+            elif not entry["ok"]:
+                entry["level"] = "bad"
+            elif not entry["alive"]:
+                entry["level"] = "warn"
+            else:
+                entry["level"] = "ok"
             return entry
 
         books = store.all(shelf_only=True)

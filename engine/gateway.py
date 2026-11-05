@@ -137,6 +137,10 @@ class BookStore:
                 continue
             try:
                 b = json.load(open(os.path.join(BOOKS_DIR, fn), encoding="utf-8"))
+                # 下划线开头的是运行时临时状态（_refreshing 等），不该从磁盘恢复：
+                # 进程在刷新途中被杀，磁盘上会留下 _refreshing=True，重启后这本书
+                # 就再也不会触发后台刷新了。
+                b.pop("_refreshing", None)
                 self._books[b["id"]] = b
             except Exception:
                 continue
@@ -167,7 +171,10 @@ class BookStore:
         with self._lock:
             b = self._books.get(bid)
             if b is not None and b.get("shelf"):
-                _atomic_write_json(os.path.join(BOOKS_DIR, bid + ".json"), b)
+                # 只写持久字段：下划线开头的是运行时状态（_refreshing 等），
+                # 写进文件会被下次启动当成真的，导致后台刷新永久停摆。
+                disk = {k: v for k, v in b.items() if not k.startswith("_")}
+                _atomic_write_json(os.path.join(BOOKS_DIR, bid + ".json"), disk)
 
     def register(self, url, title="", author="", site=""):
         """内存注册一本书（仅供网关链接寻址/懒解析），返回 book_id。

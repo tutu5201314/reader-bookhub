@@ -271,6 +271,52 @@ class LayeredFetcher:
             self._host_fail(url)
         return result
 
+    def diagnose(self, url, timeout=8):
+        """体检探活用的「为什么不通」诊断。
+
+        原来体检只有一个布尔（响应是不是 None），站点被 Cloudflare 直接拦截、
+        域名过期、404、超时四种情况在界面上都显示成「站点不可达」，
+        没法判断该换域名还是该等 L3。这里把「链路能不能过」和「为什么没过」分开：
+
+        - 先走与体检相同的 quick 链路（L1 + L2）：能过就是 alive，别误报。
+        - 过不去再补一次裸 L1，按状态码与特征页给出人话原因。
+        返回 {"ok": bool, "code": int|None, "reason": str}
+        """
+        try:
+            raw = self.s.get(url, timeout=timeout)
+        except requests.Timeout:
+            # 超时说明是网络层问题，L2 也救不了，直接给结论（省 20s）
+            return {"ok": False, "code": None, "reason": "连接超时"}
+        except requests.RequestException as e:
+            return {"ok": False, "code": None, "reason": "连接失败：%s" % type(e).__name__}
+        code = raw.status_code
+        body = (raw.text or "")[:4000]
+        low = body.lower()
+        hdr = {k.lower() for k in raw.headers}
+        if code == 200 and not is_waf_page(raw.content):
+            return {"ok": True, "code": 200, "reason": "正常"}
+
+        # L1 被挡：先给 L2（cloudscraper）一次机会，能过就不算站点挂了
+        # —— 笔趣阁tw 就是 L1 恒 403、L2 稳定 200，误报成「不可达」会误导排查。
+        r2 = self._req_quick("GET", url, None, None, allow_l2=True, timeout=timeout)
+        if r2 is not None:
+            return {"ok": True, "code": r2.status_code, "reason": "L1 被挡，L2 兜底通过"}
+
+        if code in (403, 503) and ("cloudflare" in low or "cf-ray" in hdr):
+            # CF 的硬拦截（Attention Required）与 JS 挑战（Just a moment）要分开：
+            # 前者换 IP/换域名才行，后者真浏览器（L3）有可能过。
+            if "just a moment" in low or "challenge-platform" in low:
+                return {"ok": False, "code": code, "reason": "Cloudflare 人机挑战（L3 可试）"}
+            return {"ok": False, "code": code,
+                    "reason": "Cloudflare 硬拦截（%d，本机 IP 被挡）" % code}
+        if code == 403:
+            return {"ok": False, "code": 403, "reason": "HTTP 403 拒绝访问"}
+        if code == 404:
+            return {"ok": False, "code": 404, "reason": "HTTP 404 页面已不存在"}
+        if code == 200:
+            return {"ok": False, "code": 200, "reason": "返回防护页/空页"}
+        return {"ok": False, "code": code, "reason": "HTTP %d" % code}
+
     def _req_quick(self, method, url, data, referer, allow_l2=True, timeout=8):
         """快速模式：L1 单次请求（默认 8s 超时）；失败再试一次 cloudscraper，不走 L3。
 

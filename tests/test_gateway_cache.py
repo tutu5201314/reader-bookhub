@@ -138,3 +138,35 @@ def test_try_sediment_imports_and_calls(tmp_path, monkeypatch):
     store._try_sediment("bid1")
 
     assert called.get("src"), "maybe_add_seed 没有被调用，说明导入路径仍然不通"
+
+
+def test_refreshing_flag_is_not_persisted(tmp_path, monkeypatch):
+    """_refreshing 是运行时状态：写进磁盘会让这本书重启后再也不后台刷新。"""
+    import json
+
+    store = _make_store(tmp_path, monkeypatch)
+    store._books["bid1"]["_refreshing"] = True
+    store._persist("bid1")
+
+    path = os.path.join(str(tmp_path / "books"), "bid1.json")
+    disk = json.load(open(path, encoding="utf-8"))
+    assert "_refreshing" not in disk
+    assert disk["title"] == "测试书", "持久字段不能一起被过滤掉"
+
+
+def test_stale_refreshing_flag_is_dropped_on_load(tmp_path, monkeypatch):
+    import json
+
+    books_dir = tmp_path / "books"
+    books_dir.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(gw, "DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(gw, "BOOKS_DIR", str(books_dir))
+    monkeypatch.setattr(gw, "CACHE_DIR", str(tmp_path / "cache"))
+    (books_dir / "bid1.json").write_text(json.dumps({
+        "id": "bid1", "title": "老书", "resolved": True,
+        "resolved_at": 0, "shelf": True, "_refreshing": True,
+    }, ensure_ascii=False), encoding="utf-8")
+
+    store = gw.BookStore()
+
+    assert store._books["bid1"].get("_refreshing") is None

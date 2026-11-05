@@ -23,6 +23,8 @@
 | FIX-14 | §11 | 水印规则误杀正文数字行 | 已修 |
 | FIX-15 | §12 | 结果 60 条硬截断 → 可配 + 「显示更多」 | 已修 |
 | FIX-16 | §13 | SSE 超时与站点超时耦合 | 已修 |
+| FIX-17 | 新增 | 体检只会说「站点不可达」，分不清 CF 拦截/超时/404 | 已修 |
+| FIX-18 | 新增 | `_refreshing` 被写进磁盘 → 重启后后台刷新永久停摆 | 已修 |
 
 ---
 
@@ -399,3 +401,61 @@ while pending:
 
 **验证**
 慢站（手动加 sleep 的假种子）下，快站结果仍在 1~3s 内先到；预算耗尽时已到达的批次全部保留。
+
+---
+
+## FIX-17 体检只会说「站点不可达」
+
+**对应** 用户实测反馈：`ddkshu.com` 体检报「站点不可达」（`OPTIMIZATION.md` 未列）
+**文件** `engine/fetcher.py:274-325`（新增 `diagnose`）、`server.py:589-660`、`static/index.html:284-300`
+
+**问题**
+体检探活只有一个布尔：`r = fetcher.get(url, quick=True)`，`r is None` 就算不可达。四种完全不同的情况在界面上长得一样：
+
+1. Cloudflare 硬拦截（`Attention Required!`，本机 IP 被挡，换域名/换 IP 才行）
+2. Cloudflare 人机挑战（`Just a moment`，真浏览器 L3 有可能过）
+3. 连接超时（网络层）
+4. HTTP 404（页面没了，该书要换源）
+
+实测 `https://www.ddkshu.com/dk-416895.html` → `server: cloudflare`、`cf-ray: ...-LAX`、403 + `Attention Required!`：**属于第 1 类，站点本身没挂，是我们这个出口 IP 被挡了**。而 `biquge.tw` 同样 L1 恒 403，L2 却能过 —— 若只看布尔值，这两本书会被判成同一种病。
+
+顺带两个显示问题：
+- 站点挂了时中/末章「未取到」会被误读成正文解析坏了（实际只是没缓存又抓不到）。
+- 不可达的书仍显示 🟢（`ok` 只看目录与章节 problems，不看 alive）。
+
+**改法**
+新增 `LayeredFetcher.diagnose(url)`，返回 `{"ok", "code", "reason"}`：
+
+```python
+raw = self.s.get(url, timeout=timeout)      # 裸 L1，先拿状态码
+# 200 且非 WAF 页 -> 正常
+# 超时 -> 直接返回「连接超时」（L2 救不了，省 20s）
+# 其它 -> 再给 L2 一次机会，过了就是「L1 被挡，L2 兜底通过」
+# 仍不过 -> 按特征页分类：CF 硬拦截 / CF 人机挑战 / 403 / 404 / HTTP 5xx
+```
+
+体检侧：
+- `entry["alive_reason"]` 存原因，前端标签显示「站点不可达：Cloudflare 硬拦截（403，本机 IP 被挡）」。
+- `alive=False` 时**不再实抓**中/末章，只读缓存；没缓存标 `skipped: "站点不可达，未抽查"`（省 3 次超时，也不再把站点故障误报成章节故障）。
+- 新增三态 `level`：`ok` 绿 / `warn` 黄（站点当前不可达但目录与缓存还在，仍可读已缓存章）/ `bad` 红（目录或首章坏了）。汇总文案带「N 本站点暂不可达（缓存仍可读）」。
+
+**验证**
+`tests/test_health_diagnose.py`（新增 6 条）：干净页判 ok；L2 救回不算挂；CF 硬拦截与 CF 挑战分开命名；超时不走 L2；404 命名。
+真网复跑体检（2 本）：`笔趣阁tw` → `alive=True / L1 被挡，L2 兜底通过 / level=ok`；`ddkshu.com` → `alive=False / Cloudflare 硬拦截（403，本机 IP 被挡）/ level=warn`，中/末章显示「站点不可达，未抽查」。
+
+---
+
+## FIX-18 `_refreshing` 被写进磁盘 → 后台刷新永久停摆
+
+**对应** 查 FIX-17 时顺手在 `data/books/6e31a7d02c.json` 里看到 `"_refreshing": true`
+**文件** `engine/gateway.py:135-145`（加载）、`engine/gateway.py:166-176`（持久化）
+
+**问题**
+`get_catalog` 在触发后台刷新前置 `b["_refreshing"] = True`，`_bg_refresh` 的 `finally` 里复位。但只要刷新途中进程被杀（关 Reader、Ctrl+C），`_persist` 已经把 `_refreshing: true` 写进了 `data/books/{id}.json`；重启后这个字段被当成真的读回来，于是 `if stale and not b.get("_refreshing")` 永远为假 —— **这本书的目录再也不会自动追更**，而界面上看不出任何异常。
+
+**改法**
+- `_persist` 落盘前过滤下划线开头的键（运行时状态不进文件）。
+- 加载时 `b.pop("_refreshing", None)`（已经写脏的旧文件也能自愈）。
+
+**验证**
+`tests/test_gateway_cache.py` 追加 2 条：`_persist` 后磁盘上没有 `_refreshing` 但 `title` 等持久字段还在；磁盘上带 `_refreshing: true` 的旧文件加载后该字段被丢弃。
